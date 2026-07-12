@@ -26,13 +26,6 @@ fn border_fg() -> string {
   sgr_fg("240")
 }
 
-// ESC (0x1b) as a rune, for skipping ANSI escape sequences when measuring
-// visible width. Rune literals don't accept \x escapes; a const can't hold a
-// cast; so compute it once via a helper.
-fn esc_rune() -> rune {
-  0x1b as rune
-}
-
 /// Render the whole frame for `model` at a fixed terminal size. Pure: the same
 /// model and size always produce the same string. The width/height are folded
 /// into the model so per-screen renderers (which mirror the Go methods reading
@@ -46,11 +39,32 @@ pub fn view(model: Model, width: int, height: int) -> string {
     Screen.Analytics => view_analytics(m),
     Screen.Timeline => view_timeline(m),
   }
-  if m.alert != "" {
+  let composed = if m.alert != "" {
     overlay_alert(base, m.alert, m.width)
   } else {
     base
   }
+  clamp_frame(composed, width, height)
+}
+
+/// Final safety net enforcing the two frame invariants at every size: no line's
+/// VISIBLE width exceeds `width`, and no more than `height` lines are emitted.
+/// The per-view renderers already aim for this, but at tiny sizes (or when a
+/// box's min-width guard exceeds the viewport) their arithmetic can't; this
+/// truncates rather than letting a line wrap and shear the frame. A hard cap,
+/// not a substitute for the layout math — a well-sized frame passes through
+/// untouched.
+fn clamp_frame(frame: string, width: int, height: int) -> string {
+  let w = max_int(width, 0)
+  let h = max_int(height, 0)
+  let lines = strings.Split(frame, "\n")
+  let mut out: Slice<string> = []
+  let mut i = 0
+  while i < lines.length() && i < h {
+    out = out.append(truncate_visible(lines[i], w))
+    i += 1
+  }
+  strings.Join(out, "\n")
 }
 
 // --- list ----------------------------------------------------------------
@@ -408,7 +422,7 @@ pub fn explain_lines(model: Model) -> Slice<string> {
 pub fn explain_max_line_width(model: Model) -> int {
   let mut m = 0
   for line in explain_lines(model) {
-    let w = line.runes().length()
+    let w = visible_len(line)
     if w > m {
       m = w
     }
@@ -441,7 +455,7 @@ pub fn analytics_max_line_width(model: Model) -> int {
   let fixed = AN_COL_COUNT + AN_COL_AVG + AN_COL_P95 + AN_COL_MAX + AN_COL_TOTAL + 6 + 2
   let mut m = 0
   for r in model.analytics {
-    let w = fixed + r.query.runes().length()
+    let w = fixed + visible_len(r.query)
     if w > m {
       m = w
     }
@@ -772,53 +786,5 @@ fn pad_visible(s: string, width: int) -> string {
   }
 }
 
-/// Count visible runes, skipping ANSI SGR escape sequences (ESC [ ... m).
-pub fn visible_len(s: string) -> int {
-  let esc = esc_rune()
-  let mut n = 0
-  let mut in_escape = false
-  for r in s.runes() {
-    if in_escape {
-      if r == 'm' {
-        in_escape = false
-      }
-    } else if r == esc {
-      in_escape = true
-    } else {
-      n += 1
-    }
-  }
-  n
-}
-
-/// Truncate `s` to `width` visible runes, preserving ANSI escapes and appending
-/// a reset so a cut mid-color doesn't bleed.
-fn truncate_visible(s: string, width: int) -> string {
-  let esc = esc_rune()
-  let mut out = ""
-  let mut n = 0
-  let mut in_escape = false
-  let mut saw_escape = false
-  for r in s.runes() {
-    if n >= width {
-      break
-    }
-    if in_escape {
-      out += r as string
-      if r == 'm' {
-        in_escape = false
-      }
-    } else if r == esc {
-      in_escape = true
-      saw_escape = true
-      out += r as string
-    } else {
-      out += r as string
-      n += 1
-    }
-  }
-  if saw_escape {
-    out += SGR_RESET
-  }
-  out
-}
+// visible_len / truncate_visible / esc_rune now live in format.lis (single
+// source of truth for ANSI-aware width math; all tui files share module scope).

@@ -1,0 +1,276 @@
+import "go:time"
+import "go:strings"
+import "go:regexp"
+import "event"
+
+// ============================================================================
+// Frame invariants: no line's VISIBLE width exceeds the viewport width, and no
+// frame emits more lines than the viewport height, at EVERY size and in EVERY
+// state. These are the regression tests for the ANSI-width tearing bug: styled
+// rows (colored op labels, tx-colored rows, highlighted SQL, status glyphs)
+// used to measure their escape bytes as visible cells, so padded slots ran long
+// and wrapped in a real terminal, shearing the borders diagonally.
+// ============================================================================
+
+// --- INDEPENDENT ansi stripper --------------------------------------------
+// A deliberate SECOND OPINION on visible width: a regexp over the CSI SGR form
+// ESC [ <params> m, compiled once. It shares no code with `visible_len` (the
+// production scanner) nor with view.test's `strip_ansi` — if the two disagree,
+// the invariant fails loudly rather than both being wrong the same way.
+fn sgr_re() -> Ref<regexp.Regexp> {
+  regexp.MustCompile("\x1b\\[[0-9;]*m")
+}
+
+fn strip_sgr(s: string) -> string {
+  sgr_re().ReplaceAllString(s, "")
+}
+
+// Visible rune-length by the independent path.
+fn vis_width(s: string) -> int {
+  strip_sgr(s).runes().length()
+}
+
+/// Assert a rendered frame fits its viewport: every line stripped of SGR
+/// escapes is <= width runes, and there are <= height lines. Returns the frame
+/// so callers can chain further asserts. Takes `t` so it can use `assert`.
+fn assert_fits(t: TestContext, label: string, frame: string, width: int, height: int) {
+  let lines = strings.Split(frame, "\n")
+  assert lines.length() <= height
+  for line in lines {
+    let w = vis_width(line)
+    if w > width {
+      t.log(f"{label}: line width {w} > {width}: {strip_sgr(line)}")
+    }
+    assert w <= width
+  }
+}
+
+// --- styled fixtures -------------------------------------------------------
+// Events chosen so that EVERY styling path is exercised: a plain query, a slow
+// query (SLOW glyph + purple bar), an n+1 query (N+1 glyph + yellow), a failed
+// query (E glyph + red + error message), a transaction (tx-colored rows + Tx
+// label + chevron), and a very long query (forces truncation of a styled cell).
+fn styev(
+  id: string,
+  op: event.Op,
+  query: string,
+  args: Slice<string>,
+  dur: time.Duration,
+  tx: Option<string>,
+  nplus1: bool,
+  slow: bool,
+  failed: bool,
+) -> event.Event {
+  let base = time.Date(2026, time.July, 12, 9, 15, 30, 0, time.UTC)
+  let outcome = if failed {
+    event.Outcome.Failed { message: "relation \"nope\" does not exist somewhere in a long message" }
+  } else {
+    event.Outcome.Ok { rows_affected: 4 }
+  }
+  event.Event {
+    id,
+    op,
+    query,
+    args,
+    start_time: base,
+    duration: dur,
+    outcome,
+    tx_id: tx,
+    nplus1,
+    slow,
+    normalized_query: query,
+  }
+}
+
+fn styled_events() -> Slice<event.Event> {
+  let long = "SELECT users.id, users.name, users.email, orders.total, orders.created_at FROM users JOIN orders ON orders.user_id = users.id WHERE users.active = true ORDER BY orders.created_at DESC"
+  [
+    styev("e1", event.Op.Query, "SELECT * FROM users WHERE id = $1", ["42"], 120 * time.Microsecond, None, false, false, false),
+    styev("e2", event.Op.Query, long, [], 1_500_000 * time.Microsecond, None, false, true, false),
+    styev("e3", event.Op.Query, "SELECT * FROM order_items WHERE order_id = $1", ["7"], 2200 * time.Microsecond, None, true, false, false),
+    styev("e4", event.Op.Exec, "DELETE FROM nonexistent_table", [], 800 * time.Microsecond, None, false, false, true),
+    styev("e5", event.Op.Begin, "BEGIN", [], 30 * time.Microsecond, Some("tx-9"), false, false, false),
+    styev("e6", event.Op.Query, "SELECT id FROM orders WHERE user_id = $1", ["42"], 900 * time.Microsecond, Some("tx-9"), false, false, false),
+    styev("e7", event.Op.Query, long, ["7"], 2200 * time.Microsecond, Some("tx-9"), true, false, false),
+    styev("e8", event.Op.Commit, "COMMIT", [], 40 * time.Microsecond, Some("tx-9"), false, false, false),
+  ]
+}
+
+fn styled_model() -> Model {
+  model_with(styled_events())
+}
+
+// The size grid every state is checked against.
+fn grid() -> Slice<Size> {
+  [
+    Size { width: 30, height: 8 },
+    Size { width: 47, height: 13 },
+    Size { width: 80, height: 24 },
+    Size { width: 120, height: 40 },
+    Size { width: 201, height: 50 },
+  ]
+}
+
+fn check_grid(t: TestContext, label: string, m: Model) {
+  for sz in grid() {
+    let frame = view(m, sz.width, sz.height)
+    assert_fits(t, f"{label} {sz.width}x{sz.height}", frame, sz.width, sz.height)
+  }
+}
+
+// --- the matrix ------------------------------------------------------------
+
+#[test("frame invariant: list with styled rows across the size grid")]
+fn test_grid_list_styled(t: TestContext) {
+  check_grid(t, "list", styled_model())
+}
+
+#[test("frame invariant: list with cursor on a styled slow row")]
+fn test_grid_list_cursor(t: TestContext) {
+  let mut m = styled_model()
+  // Move the cursor onto the middle rows so a styled row is the bold cursor row.
+  m = press(m, Key.Up)
+  m = press(m, Key.Up)
+  check_grid(t, "list-cursor", m)
+}
+
+#[test("frame invariant: active search footer")]
+fn test_grid_search(t: TestContext) {
+  let mut m = styled_model()
+  m = up(m, Msg.Press(Key.Char('/')))
+  m = up(m, Msg.Press(Key.Char('o')))
+  m = up(m, Msg.Press(Key.Char('r')))
+  check_grid(t, "search", m)
+}
+
+#[test("frame invariant: active filter footer with description")]
+fn test_grid_filter(t: TestContext) {
+  let mut m = styled_model()
+  m = up(m, Msg.Press(Key.Char('f')))
+  m = up(m, Msg.Press(Key.Char('s')))
+  m = up(m, Msg.Press(Key.Char('l')))
+  m = up(m, Msg.Press(Key.Char('o')))
+  m = up(m, Msg.Press(Key.Char('w')))
+  m = up(m, Msg.Press(Key.Enter))
+  check_grid(t, "filter", m)
+}
+
+#[test("frame invariant: alert overlay showing")]
+fn test_grid_alert(t: TestContext) {
+  let m = Model { alert: "N+1 detected: SELECT * FROM order_items WHERE order_id = $1", ..styled_model() }
+  check_grid(t, "alert", m)
+}
+
+#[test("frame invariant: inspect view (event and tx)")]
+fn test_grid_inspect(t: TestContext) {
+  let mut m = styled_model()
+  m = press(m, Key.Enter)
+  check_grid(t, "inspect-event", m)
+}
+
+#[test("frame invariant: explain view, plan lines longer than width")]
+fn test_grid_explain(t: TestContext) {
+  let m = styled_model()
+  let (opened, _) = update(m, Msg.Press(Key.Char('x')))
+  let plan = "Seq Scan on users  (cost=0.00..431.00 rows=10000 width=244) (actual time=0.012..3.451 rows=10000 loops=1)  Filter: (active = true) and some more very wide plan text to force horizontal scrolling well past any viewport"
+  let done = up(opened, Msg.ExplainResult { plan: Some(plan), error: None })
+  check_grid(t, "explain", done)
+  // And h-scrolled to the right.
+  let scrolled = up(done, Msg.Press(Key.Char('l')))
+  let scrolled2 = up(scrolled, Msg.Press(Key.Char('l')))
+  check_grid(t, "explain-hscroll", scrolled2)
+}
+
+#[test("frame invariant: analytics with long queries and h-scroll")]
+fn test_grid_analytics(t: TestContext) {
+  let mut m = styled_model()
+  m = up(m, Msg.Press(Key.Char('a')))
+  check_grid(t, "analytics", m)
+  let panned = up(up(m, Msg.Press(Key.Char('l'))), Msg.Press(Key.Char('l')))
+  check_grid(t, "analytics-hscroll", panned)
+}
+
+#[test("frame invariant: timeline axis, bars and labels")]
+fn test_grid_timeline(t: TestContext) {
+  let mut m = styled_model()
+  m = up(m, Msg.Press(Key.Char('t')))
+  check_grid(t, "timeline", m)
+}
+
+// --- column alignment ------------------------------------------------------
+
+#[test("column alignment: styled rows of different color share a Duration column")]
+fn test_column_alignment(t: TestContext) {
+  // The load-bearing case: a plain standalone row (uncolored op cell) vs a
+  // TRANSACTION-CHILD row whose op cell is COLORED — `pad_right(colored(op),
+  // COL_OP)`. If padding counted the color's escape bytes, the child's op cell
+  // would run short and every column after it (Duration included) would shift.
+  // The child indents 4 vs the standalone's 2 but its query column is COL-2
+  // narrower, so the Duration column lands at the same absolute STRIPPED column
+  // in both. Different colors on the two rows guarantee differing escape-byte
+  // counts, so a byte-counting pad would misalign them.
+  let evs = [
+    styev("a", event.Op.Query, "SELECT one", [], 120 * time.Microsecond, None, false, false, false),
+    styev("bg", event.Op.Begin, "BEGIN", [], 30 * time.Microsecond, Some("tx-align"), false, false, false),
+    styev("bq", event.Op.Query, "SELECT two", [], 5 * time.Millisecond, Some("tx-align"), false, false, false),
+    styev("cm", event.Op.Commit, "COMMIT", [], 20 * time.Microsecond, Some("tx-align"), false, false, false),
+  ]
+  let m = model_with(evs)
+  let frame = view(m, 120, 30)
+  let lines = strings.Split(frame, "\n")
+  let mut a_col = -1
+  let mut b_col = -1
+  for line in lines {
+    let plain = strip_sgr(line)
+    // Only the list ROW carries both the query text AND its duration; the
+    // preview pane echoes the query without a duration, so guard on both to
+    // avoid matching it (which would clobber the column with -1).
+    if a_col < 0 && strings.Contains(plain, "SELECT one") && strings.Contains(plain, "120µs") {
+      a_col = duration_col(plain, "120µs")
+    }
+    if b_col < 0 && strings.Contains(plain, "SELECT two") && strings.Contains(plain, "5.0ms") {
+      b_col = duration_col(plain, "5.0ms")
+    }
+  }
+  assert a_col >= 0
+  assert b_col >= 0
+  assert a_col == b_col
+}
+
+// Rune column at which `needle` begins in the SGR-stripped `line`, or -1. Splits
+// on the needle and measures the rune-length of the prefix, so multi-byte box
+// glyphs earlier in the line don't skew the column comparison.
+fn duration_col(plain: string, needle: string) -> int {
+  let parts = strings.SplitN(plain, needle, 2)
+  if parts.length() < 2 {
+    return -1
+  }
+  parts[0].runes().length()
+}
+
+// --- independent-stripper sanity ------------------------------------------
+
+#[test("independent SGR stripper agrees with visible_len on styled chrome")]
+fn test_stripper_agreement() {
+  let yellow = sgr_fg("3")
+  let styled = f"{SGR_BOLD}{yellow}N+1{SGR_RESET} plain {SGR_FAINT}x{SGR_RESET}"
+  assert vis_width(styled) == visible_len(styled)
+  assert vis_width(styled) == 11
+}
+
+// --- painter frame hygiene -------------------------------------------------
+
+#[test("compose_frame homes, erases each line, joins with CRLF, erases below")]
+fn test_compose_frame_hygiene() {
+  let out = compose_frame("aa\nbbb")
+  // Homes the cursor, never a full-screen 2J erase (that would flicker).
+  assert strings.HasPrefix(out, "\x1b[H")
+  assert !strings.Contains(out, "\x1b[2J")
+  // Each line is followed by erase-to-end-of-line so residue is overwritten.
+  assert strings.Contains(out, f"aa{ERASE_LINE}")
+  assert strings.Contains(out, f"bbb{ERASE_LINE}")
+  // Lines carry an explicit CR (raw mode has no implicit carriage return).
+  assert strings.Contains(out, "\r\n")
+  // Ends with erase-below so a shrunk frame leaves no stale trailing rows.
+  assert strings.HasSuffix(out, ERASE_BELOW)
+}
