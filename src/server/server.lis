@@ -1,0 +1,197 @@
+import "go:context"
+import "go:encoding/json"
+import "go:errors"
+import "go:net"
+import "go:net/http"
+import "go:time"
+
+import "broker"
+import "event"
+import "explain"
+
+/// The HTTP server for sql-tap. It replaces both the Go gRPC server and the Go
+/// web server: one server serves the browser UI (static assets), the SSE event
+/// stream at GET /api/events, and the EXPLAIN endpoint at POST /api/explain.
+/// TUI/CI clients consume the same HTTP API.
+///
+/// The server owns an `http.Server` (configured with a 10s ReadHeaderTimeout)
+/// and holds the shared broker plus an optional EXPLAIN client. When the client
+/// is absent (no DATABASE_URL), /api/explain answers 503.
+pub struct Server {
+  b: Ref<broker.Broker>,
+  ex: Option<explain.Client>,
+  http_server: Ref<http.Server>,
+}
+
+impl Server {
+  /// Create a Server backed by `b`. `explain_client` is `None` when EXPLAIN is
+  /// not configured. Registers the routes and configures the `http.Server`.
+  pub fn new(b: Ref<broker.Broker>, explain_client: Option<explain.Client>) -> Server {
+    let mux = http.NewServeMux()
+
+    mux.HandleFunc("GET /api/events", |w, r| { handle_sse(b, w, r) })
+    mux.HandleFunc("POST /api/explain", |w, r| { handle_explain(explain_client, w, r) })
+    // Exact root and the two named assets are served from memory; any other
+    // path under "/" falls through to a 404 from asset_for.
+    mux.HandleFunc("GET /", handle_static)
+
+    let http_server = &http.Server {
+      Handler: Some(mux),
+      ReadHeaderTimeout: 10 as time.Duration * time.Second,
+      ..
+    }
+
+    Server { b, ex: explain_client, http_server }
+  }
+
+  /// Serve HTTP on `lis` until the server is shut down or closed. A clean
+  /// shutdown surfaces as `http.ErrServerClosed`, which is treated as success.
+  pub fn serve(self, lis: net.Listener) -> Result<(), error> {
+    match self.http_server.Serve(lis) {
+      Ok(_) => Ok(()),
+      Err(e) => if errors.Is(e, http.ErrServerClosed) {
+        Ok(())
+      } else {
+        Err(e).wrap_err("server: serve")
+      },
+    }
+  }
+
+  /// Gracefully stop the HTTP server, waiting for in-flight requests up to the
+  /// deadline carried by `ctx`.
+  pub fn shutdown(self, ctx: context.Context) -> Result<(), error> {
+    self.http_server.Shutdown(ctx).wrap_err("server: shutdown")
+  }
+}
+
+/// Serve a static asset from memory, or 404 for unknown paths under "/".
+fn handle_static(w: http.ResponseWriter, r: Ref<http.Request>) {
+  let path = r.URL.map_or("/", |u| u.Path)
+  match asset_for(path) {
+    Some(a) => {
+      w.Header().Set("Content-Type", a.content_type)
+      let _ = w.Write(a.body)
+    },
+    None => http.Error(w, "not found", http.StatusNotFound),
+  }
+}
+
+/// Stream broker events as Server-Sent Events. Subscribes on connect and
+/// unsubscribes when the request context is done or the broker channel closes.
+fn handle_sse(b: Ref<broker.Broker>, w: http.ResponseWriter, r: Ref<http.Request>) {
+  w.Header().Set("Content-Type", "text/event-stream")
+  w.Header().Set("Cache-Control", "no-cache")
+  w.Header().Set("Connection", "keep-alive")
+  w.Header().Set("Access-Control-Allow-Origin", "*")
+
+  let rc = http.NewResponseController(w)
+  // Flush the headers immediately so the client sees the stream open.
+  let _ = rc.Flush()
+
+  let sub = b.subscribe()
+  defer b.unsubscribe(sub.id)
+
+  let ctx = r.Context()
+  let done = ctx.Done()
+  loop {
+    select {
+      let _ = done.receive() => { return },
+      let Some(e) = sub.events.receive() => {
+        if !write_sse_event(w, e) {
+          return
+        }
+        let _ = rc.Flush()
+      },
+    }
+  }
+}
+
+/// Marshal `e` to its wire JSON and write one SSE `data:` frame. Returns false
+/// if marshalling or writing fails, so the caller can end the stream.
+fn write_sse_event(w: http.ResponseWriter, e: event.Event) -> bool {
+  let wire = event.WireEvent.from_event(e)
+  let data = match json.Marshal(wire) {
+    Ok(bytes) => bytes,
+    Err(_) => return false,
+  }
+  let frame = "data: " + (data as string) + "\n\n"
+  match w.Write(frame as Slice<byte>) {
+    Partial.Err(_) => false,
+    _ => true,
+  }
+}
+
+/// Request body for POST /api/explain.
+#[json]
+struct ExplainRequest {
+  query: string,
+  args: Slice<string>,
+  analyze: bool,
+}
+
+/// Response body for POST /api/explain. Exactly one of `plan`/`error` is set.
+#[json]
+struct ExplainResponse {
+  #[json(omitempty)] plan: string,
+  #[json(omitempty)] error: string,
+}
+
+/// Run EXPLAIN for the posted query. 503 when unconfigured, 400 on a bad body,
+/// 500 on a run error, 200 with the plan on success.
+fn handle_explain(client: Option<explain.Client>, w: http.ResponseWriter, r: Ref<http.Request>) {
+  let Some(ex) = client else {
+    write_json(w, http.StatusServiceUnavailable, ExplainResponse {
+      error: "EXPLAIN is not configured (set DATABASE_URL)",
+      ..
+    })
+    return
+  }
+
+  let body = match r.Body {
+    Some(rc) => rc,
+    None => {
+      write_json(w, http.StatusBadRequest, ExplainResponse {
+        error: "invalid request body: missing body",
+        ..
+      })
+      return
+    },
+  }
+
+  let mut req = ExplainRequest { .. }
+  if let Err(e) = json.NewDecoder(body).Decode(&req) {
+    write_json(w, http.StatusBadRequest, ExplainResponse {
+      error: f"invalid request body: {e}",
+      ..
+    })
+    return
+  }
+
+  let mode = if req.analyze { explain.Mode.Analyze } else { explain.Mode.Plan }
+  match ex.run(r.Context(), mode, req.query, req.args) {
+    Ok(out) => write_json(w, http.StatusOK, ExplainResponse { plan: out.plan, .. }),
+    Err(e) => write_json(w, http.StatusInternalServerError, ExplainResponse {
+      error: f"{e}",
+      ..
+    }),
+  }
+}
+
+/// Write `v` as JSON with the given status, matching the Go writeJSON: an
+/// application/json Content-Type and a trailing newline after the body.
+///
+/// The Go original sanitized invalid UTF-8 before marshalling; that is
+/// unnecessary here because encoding/json replaces invalid UTF-8 automatically.
+fn write_json(w: http.ResponseWriter, status: int, v: ExplainResponse) {
+  let body = match json.Marshal(v) {
+    Ok(bytes) => bytes,
+    Err(e) => {
+      http.Error(w, f"{e}", http.StatusInternalServerError)
+      return
+    },
+  }
+  w.Header().Set("Content-Type", "application/json")
+  w.WriteHeader(status)
+  let _ = w.Write(body)
+  let _ = w.Write("\n" as Slice<byte>)
+}
