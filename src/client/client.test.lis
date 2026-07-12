@@ -1,0 +1,140 @@
+import "go:context"
+import "go:encoding/json"
+import "go:net/http"
+import "go:net/http/httptest"
+import "go:strings"
+
+import "event"
+
+// --- parse_sse_line unit tests -------------------------------------------
+
+#[test]
+fn parse_sse_line_valid() {
+  let line =
+    "data: {\"id\":\"1\",\"op\":\"Query\",\"query\":\"SELECT 1\",\"duration_ms\":2.5,\"rows_affected\":3}"
+  let assert Some(ev) = parse_sse_line(line)
+  assert ev.id == "1"
+  assert ev.query == "SELECT 1"
+  assert ev.op == event.Op.Query
+  assert ev.outcome.rows() == 3
+}
+
+#[test]
+fn parse_sse_line_blank_is_none() {
+  assert parse_sse_line("").is_none()
+}
+
+#[test]
+fn parse_sse_line_non_data_is_none() {
+  assert parse_sse_line(": comment").is_none()
+  assert parse_sse_line("event: message").is_none()
+}
+
+#[test]
+fn parse_sse_line_malformed_json_is_none() {
+  assert parse_sse_line("data: {not valid json").is_none()
+}
+
+#[test]
+fn base_url_adds_scheme() {
+  assert base_url("localhost:8080") == "http://localhost:8080"
+  assert base_url("http://localhost:8080") == "http://localhost:8080"
+}
+
+// --- end-to-end watch() + explain() over httptest ------------------------
+
+/// One SSE data frame carrying the given event as a WireEvent JSON line.
+fn sse_frame(ev: event.Event) -> Result<string, error> {
+  let wire = event.WireEvent.from_event(ev)
+  let bytes = json.Marshal(wire)?
+  Ok(f"data: {bytes as string}\n\n")
+}
+
+/// Build an event with just the fields the tests observe.
+fn ev(id: string, query: string) -> event.Event {
+  event.Event {
+    id,
+    op: event.Op.Query,
+    query,
+    outcome: event.Outcome.Ok { rows_affected: 0 },
+    ..
+  }
+}
+
+/// Register both daemon endpoints on a mux and return a started test server.
+fn test_server() -> Ref<httptest.Server> {
+  let mux = http.NewServeMux()
+
+  mux.HandleFunc("/api/events", |w, _r| {
+    w.Header().Set("Content-Type", "text/event-stream")
+    let frames = [ev("1", "SELECT 1"), ev("2", "SELECT 2")]
+    for e in frames {
+      if let Ok(frame) = sse_frame(e) {
+        let _ = w.Write(frame as Slice<byte>)
+      }
+    }
+  })
+
+  mux.HandleFunc("/api/explain", |w, r| {
+    let mut req = ExplainRequest { query: "", args: [], analyze: false }
+    let Some(body) = r.Body else {
+      w.WriteHeader(http.StatusBadRequest)
+      let _ = w.Write("{\"error\":\"no body\"}" as Slice<byte>)
+      return
+    }
+    let _ = json.NewDecoder(body).Decode(&req)
+    if strings.Contains(req.query, "boom") {
+      w.WriteHeader(http.StatusInternalServerError)
+      let _ = w.Write("{\"error\":\"explain failed: boom\"}" as Slice<byte>)
+      return
+    }
+    let analyze_note = if req.analyze { " (analyzed)" } else { "" }
+    let plan = f"Seq Scan on t{analyze_note}"
+    let resp = ExplainOk { plan }
+    if let Ok(bytes) = json.Marshal(resp) {
+      let _ = w.Write(bytes)
+    }
+  })
+
+  httptest.NewServer(mux)
+}
+
+#[test]
+fn watch_streams_then_closes() {
+  let server = test_server()
+  defer server.Close()
+
+  let assert Ok(ch) = watch(context.Background(), server.URL)
+
+  let mut got: Slice<string> = []
+  for e in ch {
+    got = got.append(e.id)
+  }
+
+  assert got.length() == 2
+  assert got[0] == "1"
+  assert got[1] == "2"
+}
+
+#[test]
+fn explain_success() {
+  let server = test_server()
+  defer server.Close()
+
+  let args: Slice<string> = []
+  let assert Ok(plan) =
+    explain(context.Background(), server.URL, "SELECT * FROM t", args, true)
+  assert plan == "Seq Scan on t (analyzed)"
+}
+
+#[test]
+fn explain_error_returns_server_message() {
+  let server = test_server()
+  defer server.Close()
+
+  let args: Slice<string> = []
+  let result =
+    explain(context.Background(), server.URL, "boom query", args, false)
+  let assert Err(e) = result
+  assert strings.Contains(f"{e}", "explain failed: boom")
+}
