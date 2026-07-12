@@ -12,21 +12,16 @@ pub struct WireEvent {
   pub start_time: time.Time,
   pub duration_ms: float64,
   pub rows_affected: int64,
-  #[json(omitempty)]
-  pub error: string,
-  #[json(omitempty)]
-  pub tx_id: string,
-  #[json("n_plus_1", omitempty)]
-  pub n_plus_1: bool,
-  #[json(omitempty)]
-  pub slow_query: bool,
-  #[json(omitempty)]
-  pub normalized_query: string,
+  #[json(omitempty)] pub error: string,
+  #[json(omitempty)] pub tx_id: string,
+  #[json("n_plus_1", omitempty)] pub n_plus_1: bool,
+  #[json(omitempty)] pub slow_query: bool,
+  #[json(omitempty)] pub normalized_query: string,
 }
 
 impl WireEvent {
   pub fn from_event(ev: Event) -> WireEvent {
-    WireEvent { 
+    WireEvent {
       id: ev.id,
       op: ev.op,
       query: ev.query,
@@ -50,7 +45,7 @@ impl WireEvent {
     }
     let micros = (self.duration_ms * 1000.0) as int64
     let tx_id = if self.tx_id == "" { None } else { Some(self.tx_id) }
-    Event { 
+    Event {
       id: self.id,
       op: self.op,
       query: self.query,

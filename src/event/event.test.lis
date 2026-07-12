@@ -2,7 +2,7 @@ import "go:encoding/json"
 import "go:time"
 
 fn sample_event() -> Event {
-  Event { 
+  Event {
     id: "42",
     op: Op.Execute,
     query: "SELECT * FROM users WHERE id = $1",

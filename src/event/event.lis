@@ -51,14 +51,16 @@ impl Outcome {
   }
 
   pub fn is_failed(self) -> bool {
-    match self {
-      Outcome.Failed { .. } => true,
-      Outcome.Ok { .. } => false,
-    }
+    match self { Outcome.Failed { .. } => true, Outcome.Ok { .. } => false }
   }
 }
 
 /// A captured database query event, as observed by the proxy.
+///
+/// `tx_id` names the transaction this event belongs to, when one is active.
+/// `nplus1` is set by the N+1 detector, `slow` when the duration met the
+/// slow-query threshold. `normalized_query` is the query with literals
+/// replaced by placeholders (empty when the query is empty).
 pub struct Event {
   pub id: string,
   pub op: Op,
@@ -73,10 +75,6 @@ pub struct Event {
   pub normalized_query: string,
 }
 
-/// Transaction this event belongs to, when one is active.
-/// Flagged by the N+1 detector.
-/// Duration met the slow-query threshold.
-/// Query with literals replaced by placeholders; empty when query is empty.
 impl Event {
   pub fn duration_ms(self) -> float64 {
     (self.duration.Microseconds() as float64) / 1000.0
