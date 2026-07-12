@@ -1,0 +1,91 @@
+/// Build a COM_STMT_EXECUTE payload from a null bitmap, type/value pairs.
+fn build_execute_payload(
+  num_params: int,
+  null_bitmap: Slice<byte>,
+  types: Slice<byte>,
+  values: Slice<byte>,
+) -> Slice<byte> {
+  // command(1) + stmt_id(4) + flags(1) + iteration_count(4)
+  let mut p: Slice<byte> = [0x17, 0x01, 0, 0, 0, 0, 0x01, 0, 0, 0]
+  if num_params > 0 {
+    for b in null_bitmap {
+      p = p.append(b)
+    }
+    p = p.append(0x01)
+    // new-params-bound
+    for b in types {
+      p = p.append(b)
+    }
+    for b in values {
+      p = p.append(b)
+    }
+  }
+  p
+}
+
+#[test("no params yields empty args")]
+fn test_execute_no_params() {
+  let p = build_execute_payload(0, [], [], [])
+  let args = parse_stmt_execute_args(p, 0)
+  assert args.is_empty()
+}
+
+#[test("two integer params decode to decimal strings")]
+fn test_execute_two_ints() {
+  // types: LONGLONG, LONGLONG (with unsigned flag byte after each)
+  let types: Slice<byte> = [MYSQL_TYPE_LONGLONG, 0, MYSQL_TYPE_LONGLONG, 0]
+  // values: 1 and 2 as int64 LE (8 bytes each)
+  let values: Slice<byte> = [1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0]
+  let p = build_execute_payload(2, [0x00], types, values)
+  let args = parse_stmt_execute_args(p, 2)
+  assert args.length() == 2
+  assert args[0] == "1"
+  assert args[1] == "2"
+}
+
+#[test("string params decode via length-encoded strings")]
+fn test_execute_strings() {
+  // 0xfd = MYSQL_TYPE_VAR_STRING (decoded as a length-encoded string)
+  let types: Slice<byte> = [0xfd, 0, 0xfd, 0]
+  // "hello" (len 5) then "world" (len 5), lenenc prefixed
+  let values: Slice<byte> = [
+    5,
+    0x68,
+    0x65,
+    0x6c,
+    0x6c,
+    0x6f,
+    5,
+    0x77,
+    0x6f,
+    0x72,
+    0x6c,
+    0x64,
+  ]
+  let p = build_execute_payload(2, [0x00], types, values)
+  let args = parse_stmt_execute_args(p, 2)
+  assert args.length() == 2
+  assert args[0] == "hello"
+  assert args[1] == "world"
+}
+
+#[test("null params come from the bitmap")]
+fn test_execute_null() {
+  // one param, marked NULL in the bitmap (bit 0 set)
+  let types: Slice<byte> = [MYSQL_TYPE_LONGLONG, 0]
+  let p = build_execute_payload(1, [0x01], types, [])
+  let args = parse_stmt_execute_args(p, 1)
+  assert args.length() == 1
+  assert args[0] == "NULL"
+}
+
+#[test("tiny and short signed integers")]
+fn test_execute_tiny_short() {
+  let types: Slice<byte> = [MYSQL_TYPE_TINY, 0, MYSQL_TYPE_SHORT, 0]
+  // tiny -1 (0xFF as int8), short 258 (0x0102 LE)
+  let values: Slice<byte> = [0xFF, 0x02, 0x01]
+  let p = build_execute_payload(2, [0x00], types, values)
+  let args = parse_stmt_execute_args(p, 2)
+  assert args[0] == "-1"
+  assert args[1] == "258"
+}

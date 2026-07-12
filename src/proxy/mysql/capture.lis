@@ -1,0 +1,294 @@
+import "event"
+import "proxy"
+import "go:encoding/binary"
+import "go:strconv"
+import "go:time"
+
+/// MySQL client command bytes (first payload byte of a command packet).
+const COM_QUERY: byte = 0x03
+const COM_STMT_PREPARE: byte = 0x16
+const COM_STMT_EXECUTE: byte = 0x17
+const COM_STMT_CLOSE: byte = 0x19
+
+/// MySQL response packet type indicators (first payload byte).
+const I_OK: byte = 0x00
+const I_ERR: byte = 0xFF
+
+/// A prepared statement's query text and parameter count, keyed by statement id.
+struct PreparedStmt {
+  query: string,
+  num_params: int,
+}
+
+/// Where the upstream-response parser is in a command's response sequence.
+/// Payload-only data (the pending event, prepared-statement metadata) lives in
+/// the connection's capture state, not here, because it persists across states.
+enum ResponseState {
+  /// No command is awaiting a response; upstream packets are ignored.
+  Idle,
+  /// Waiting for the first response packet to the last command.
+  FirstResp,
+  /// Reading column definition packets (until EOF).
+  ColumnDefs,
+  /// Reading result-set row packets (until EOF or ERR).
+  RowData,
+  /// Skipping the param/column definition packets after COM_STMT_PREPARE_OK.
+  SkipPrepare { remaining: int },
+}
+
+/// The last client command we saw, retained so the upstream parser can
+/// interpret its response (e.g. an OK after PREPARE means STMT_PREPARE_OK).
+enum LastCommand {
+  None,
+  Query,
+  Prepare,
+  Execute,
+}
+
+/// All per-connection capture state. Owned exclusively by one connection actor,
+/// so it needs no locking — the single deliberate divergence from the Go
+/// original, which guarded `pending` with a mutex across two goroutines.
+pub struct Capture {
+  prepared_stmts: Map<uint32, PreparedStmt>,
+  last_command: LastCommand,
+  last_query: string,
+  tx: proxy.TxTracker,
+  next_id: uint64,
+  state: ResponseState,
+  pending: Option<event.Event>,
+}
+
+impl Capture {
+  pub fn new() -> Capture {
+    Capture {
+      prepared_stmts: Map.new(),
+      last_command: LastCommand.None,
+      tx: proxy.TxTracker.new(),
+      state: ResponseState.Idle,
+      ..
+    }
+  }
+
+  fn generate_id(self: Ref<Capture>) -> string {
+    self.next_id += 1
+    strconv.FormatUint(self.next_id, 10)
+  }
+
+  /// Build a fresh pending event from a query, running transaction detection.
+  fn begin_event(
+    self: Ref<Capture>,
+    query: string,
+    args: Slice<string>,
+    default_op: event.Op,
+    now: time.Time,
+  ) {
+    let id = self.generate_id()
+    let info = self.tx.transition(query, default_op, proxy.random_tx_id())
+    self.pending = Some(event.Event {
+      id,
+      op: info.op,
+      query,
+      args,
+      start_time: now,
+      outcome: event.Outcome.Ok { rows_affected: 0 },
+      tx_id: info.tx_id,
+      ..
+    })
+  }
+
+  /// Inspect one client->upstream packet and update capture state. Called
+  /// before the raw packet is relayed to the upstream. `now` is the observed
+  /// time (passed in so tests stay deterministic).
+  pub fn on_client_packet(self: Ref<Capture>, pkt: Slice<byte>, now: time.Time) {
+    if payload_len(pkt) < 1 {
+      return
+    }
+    let cmd = payload_byte(pkt)
+    // payload starts at index 4; payload[1:] is pkt[5..].
+    if cmd == COM_QUERY {
+      let query = pkt[5..] as string
+      self.last_command = LastCommand.Query
+      self.last_query = query
+      self.state = ResponseState.FirstResp
+      self.begin_event(query, [], event.Op.Query, now)
+    } else if cmd == COM_STMT_PREPARE {
+      let query = pkt[5..] as string
+      self.last_command = LastCommand.Prepare
+      self.last_query = query
+      self.state = ResponseState.FirstResp
+    } else if cmd == COM_STMT_EXECUTE {
+      self.last_command = LastCommand.Execute
+      self.state = ResponseState.FirstResp
+      if pkt.length() >= 9 {
+        // stmt_id = LE uint32 of payload[1:5] = pkt[5..9]
+        let stmt_id = binary.LittleEndian.Uint32(pkt[5..9])
+        let stmt = self.prepared_stmts.get(stmt_id).unwrap_or(PreparedStmt {
+          query: "",
+          num_params: 0,
+        })
+        self.last_query = stmt.query
+        let args = parse_stmt_execute_args(pkt[4..], stmt.num_params)
+        self.begin_event(stmt.query, args, event.Op.Execute, now)
+      }
+    } else if cmd == COM_STMT_CLOSE && pkt.length() >= 9 {
+      let stmt_id = binary.LittleEndian.Uint32(pkt[5..9])
+      self.prepared_stmts.delete(stmt_id)
+    }
+  }
+
+  /// Inspect one upstream->client packet and advance the response state
+  /// machine. Returns a finalized event when this packet completes a command.
+  /// Called before the raw packet is relayed to the client.
+  pub fn on_upstream_packet(self: Ref<Capture>, pkt: Slice<byte>, now: time.Time) -> Option<event.Event> {
+    match self.state {
+      ResponseState.Idle => None,
+      ResponseState.FirstResp => self.handle_first_response(pkt, now),
+      ResponseState.ColumnDefs => {
+        if is_eof_packet(pkt) {
+          self.state = ResponseState.RowData
+        }
+        None
+      },
+      ResponseState.RowData => {
+        if is_eof_packet(pkt) {
+          let ev = self.finalize_result_set(now)
+          self.state = ResponseState.Idle
+          ev
+        } else if payload_byte(pkt) == I_ERR {
+          let ev = self.finalize_error(pkt, now)
+          self.state = ResponseState.Idle
+          ev
+        } else {
+          None
+        }
+      },
+      ResponseState.SkipPrepare { remaining } => {
+        let left = remaining - 1
+        if left <= 0 {
+          self.state = ResponseState.Idle
+        } else {
+          self.state = ResponseState.SkipPrepare { remaining: left }
+        }
+        None
+      },
+    }
+  }
+
+  fn handle_first_response(self: Ref<Capture>, pkt: Slice<byte>, now: time.Time) -> Option<event.Event> {
+    let first = payload_byte(pkt)
+    let is_prepare = self.last_command.is_prepare()
+
+    if first == I_OK && !is_prepare {
+      let ev = self.finalize_ok(pkt, now)
+      self.state = ResponseState.Idle
+      ev
+    } else if first == I_ERR {
+      let ev = self.finalize_error(pkt, now)
+      self.state = ResponseState.Idle
+      ev
+    } else if first == I_OK && is_prepare {
+      self.handle_stmt_prepare_ok(pkt)
+      None
+    } else {
+      // Column count packet: transition to reading column definitions.
+      self.state = ResponseState.ColumnDefs
+      None
+    }
+  }
+
+  fn handle_stmt_prepare_ok(self: Ref<Capture>, pkt: Slice<byte>) {
+    // COM_STMT_PREPARE_OK payload: status(1) + stmt_id(4) + num_columns(2)
+    // + num_params(2) + reserved(1) + warning_count(2) = 12 bytes.
+    if payload_len(pkt) < 12 {
+      self.state = ResponseState.Idle
+      return
+    }
+    let stmt_id = binary.LittleEndian.Uint32(pkt[5..9])
+    let num_columns = binary.LittleEndian.Uint16(pkt[9..11])
+    let num_params = binary.LittleEndian.Uint16(pkt[11..13])
+
+    self.prepared_stmts[stmt_id] = PreparedStmt {
+      query: self.last_query,
+      num_params: num_params as int,
+    }
+
+    // Skip param defs + EOF and column defs + EOF.
+    let mut skip = 0
+    if num_params > 0 {
+      skip += (num_params as int) + 1
+    }
+    if num_columns > 0 {
+      skip += (num_columns as int) + 1
+    }
+    if skip > 0 {
+      self.state = ResponseState.SkipPrepare { remaining: skip }
+    } else {
+      self.state = ResponseState.Idle
+    }
+  }
+
+  fn finalize_ok(self: Ref<Capture>, pkt: Slice<byte>, now: time.Time) -> Option<event.Event> {
+    let Some(ev) = self.take_pending() else {
+      return None
+    }
+    let duration = now.Sub(ev.start_time)
+    // affected_rows is a length-encoded int at payload offset 1 (= pkt[5]).
+    let mut rows = 0 as int64
+    if payload_len(pkt) > 1 {
+      let (v, _) = read_lenenc_int(pkt[4..], 1)
+      rows = v as int64
+    }
+    Some(event.Event {
+      duration,
+      outcome: event.Outcome.Ok { rows_affected: rows },
+      ..ev
+    })
+  }
+
+  fn finalize_error(self: Ref<Capture>, pkt: Slice<byte>, now: time.Time) -> Option<event.Event> {
+    let Some(ev) = self.take_pending() else {
+      return None
+    }
+    let duration = now.Sub(ev.start_time)
+    // ERR_Packet: 0xFF + errno(2) + '#' + sqlstate(5) + message.
+    // In payload terms: payload[3]=='#' -> message payload[9:], else payload[3:].
+    let plen = payload_len(pkt)
+    let message = if plen > 9 && pkt[7] == 0x23 {
+      pkt[13..] as string
+    } else if plen > 3 {
+      pkt[7..] as string
+    } else {
+      ""
+    }
+    Some(event.Event {
+      duration,
+      outcome: event.Outcome.Failed { message },
+      ..ev
+    })
+  }
+
+  fn finalize_result_set(self: Ref<Capture>, now: time.Time) -> Option<event.Event> {
+    let Some(ev) = self.take_pending() else {
+      return None
+    }
+    let duration = now.Sub(ev.start_time)
+    // Result-set completion carries no affected-row count; report 0.
+    Some(event.Event {
+      duration,
+      outcome: event.Outcome.Ok { rows_affected: 0 },
+      ..ev
+    })
+  }
+
+  fn take_pending(self: Ref<Capture>) -> Option<event.Event> {
+    let taken = self.pending
+    self.pending = None
+    taken
+  }
+}
+
+impl LastCommand {
+  fn is_prepare(self) -> bool {
+    match self { LastCommand.Prepare => true, _ => false }
+  }
+}

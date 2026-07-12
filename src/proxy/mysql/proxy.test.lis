@@ -1,0 +1,198 @@
+import "event"
+import "go:context"
+import "go:net"
+import "go:time"
+
+/// Build a minimal HandshakeV10 greeting payload with all `strip` capability
+/// bits set, so the proxy has something to clear. Layout: protocol_version(1),
+/// NUL-terminated version, connection_id(4), auth_data_1(8), filler(1),
+/// cap_lower(2), charset(1), status(2), cap_upper(2), then trailing bytes.
+fn greeting_payload() -> Slice<byte> {
+  let mut p: Slice<byte> = [0x0a] // protocol version 10
+  for b in ("8.0.0" as Slice<byte>) {
+    p = p.append(b)
+  }
+  p = p.append(0x00) // NUL terminator
+  // base starts here. connection_id(4) + auth_data_1(8) + filler(1) = 13 bytes
+  for _ in 0..13 {
+    p = p.append(0x00)
+  }
+  // cap_flags_lower (2): set SSL (bit 11) -> 0x0800
+  p = p.append(0x00)
+  p = p.append(0x08)
+  p = p.append(0x21) // charset
+  p = p.append(0x00) // status(2)
+  p = p.append(0x00)
+  // cap_flags_upper (2): set QUERY_ATTRIBUTES (bit 27 -> upper bit 11) 0x0800
+  p = p.append(0x00)
+  p = p.append(0x08)
+  // trailing auth-plugin bytes (arbitrary)
+  for _ in 0..12 {
+    p = p.append(0x00)
+  }
+  p
+}
+
+/// Read exactly one packet from `conn` in the test (blocking).
+fn read_one(conn: net.Conn) -> Slice<byte> {
+  read_packet(conn).unwrap_or([])
+}
+
+/// The bound address of a listener as a string (empty when unavailable).
+fn addr_of(listener: net.Listener) -> string {
+  listener.Addr().map_or("", |a| a.String())
+}
+
+/// A fake MySQL upstream that accepts every proxied connection and, per
+/// connection, sends a greeting, consumes the handshake response, sends auth
+/// OK, then answers each COM_QUERY with an OK packet carrying `rows` affected.
+/// Looping keeps readiness-probe connections from starving the real client.
+fn fake_upstream(listener: net.Listener, rows: byte) {
+  loop {
+    let conn = match listener.Accept() {
+      Ok(c) => c,
+      Err(_) => { return },
+    }
+    task { serve_fake_upstream(conn, rows) }
+  }
+}
+
+fn serve_fake_upstream(conn: net.Conn, rows: byte) {
+  defer conn.Close()
+  // greeting
+  let _ = write_packet(conn, make_packet(0, greeting_payload()))
+  // client handshake response
+  let _ = read_one(conn)
+  // auth OK
+  let _ = write_packet(conn, make_packet(2, [0x00, 0x00, 0x00, 0x02, 0x00]))
+  // answer commands until the client goes away
+  loop {
+    let pkt = read_one(conn)
+    if pkt.is_empty() {
+      return
+    }
+    // respond OK with affected rows
+    let _ = write_packet(conn, make_packet(1, [0x00, rows, 0x00, 0x02, 0x00]))
+  }
+}
+
+/// Drive a full client session against the proxy: consume the greeting, send a
+/// handshake response, consume auth OK, send a COM_QUERY, consume its OK.
+fn fake_client(addr: string, query: string) {
+  let conn = match net.Dial("tcp", addr) {
+    Ok(c) => c,
+    Err(_) => { return },
+  }
+  defer conn.Close()
+  // greeting
+  let _ = read_one(conn)
+  // handshake response with capability bits (first 4 payload bytes)
+  let _ = write_packet(conn, make_packet(1, [0xFF, 0xFF, 0xFF, 0x0F, 0x00]))
+  // auth OK
+  let _ = read_one(conn)
+  // COM_QUERY
+  let mut payload: Slice<byte> = [0x03]
+  for b in (query as Slice<byte>) {
+    payload = payload.append(b)
+  }
+  let _ = write_packet(conn, make_packet(0, payload))
+  // response OK
+  let _ = read_one(conn)
+}
+
+#[test("capability bits are stripped from the server greeting")]
+fn test_greeting_capabilities_cleared() {
+  let mut greeting = make_packet(0, greeting_payload())
+  let cleared = clear_capability_bits(greeting, strip_caps())
+
+  // Find NUL to locate capability offsets (payload starts at index 4).
+  // version "8.0.0" is 5 bytes at payload[1..6], NUL at payload[6].
+  // base (payload offset) = 7; lower caps at payload 7+13=20 -> pkt index 24.
+  let lower = (cleared[24] as int) | ((cleared[25] as int) << 8)
+  // upper caps at payload 7+18=25 -> pkt index 29.
+  let upper = (cleared[29] as int) | ((cleared[30] as int) << 8)
+  // SSL (bit 11) must be cleared in the lower word.
+  assert (lower & 0x0800) == 0
+  // QUERY_ATTRIBUTES upper bit must be cleared in the upper word.
+  assert (upper & 0x0800) == 0
+}
+
+#[test("client capability bits are stripped from the handshake response")]
+fn test_client_capabilities_cleared() {
+  // payload: caps = 0xFFFFFFFF (all bits) then a trailing byte.
+  let mut resp = make_packet(1, [0xFF, 0xFF, 0xFF, 0xFF, 0x00])
+  let cleared = clear_client_capability_bits(resp, strip_caps())
+  let c0 = cleared[4] as uint32
+  let c1 = (cleared[5] as uint32) << 8
+  let c2 = (cleared[6] as uint32) << 16
+  let c3 = (cleared[7] as uint32) << 24
+  let caps = c0 | c1 | c2 | c3
+  // None of the stripped bits remain set.
+  assert (caps & strip_caps()) == 0
+  // A non-stripped bit (bit 0) is preserved.
+  assert (caps & 1) == 1
+}
+
+#[test("end-to-end proxy captures a query event with affected rows")]
+fn test_proxy_end_to_end() {
+  // Fake upstream on an ephemeral port.
+  let up_listener = match net.Listen("tcp", "127.0.0.1:0") {
+    Ok(l) => l,
+    Err(_) => { return },
+  }
+  let upstream_addr = addr_of(up_listener)
+  task { fake_upstream(up_listener, 7) }
+
+  // Proxy on another ephemeral port.
+  let proxy_listener = match net.Listen("tcp", "127.0.0.1:0") {
+    Ok(l) => l,
+    Err(_) => { return },
+  }
+  let proxy_addr = addr_of(proxy_listener)
+  let _ = proxy_listener.Close()
+
+  let (ctx, cancel) = context.WithCancel(context.Background())
+  defer cancel()
+  let events = Channel.buffered<event.Event>(16)
+  task {
+    let _ = listen_and_serve(ctx, proxy_addr, upstream_addr, events)
+  }
+
+  // Give the proxy a moment to bind, then run a client session.
+  wait_for_listen(proxy_addr)
+  task { fake_client(proxy_addr, "INSERT INTO t VALUES (1)") }
+
+  let ev = receive_event(events)
+  assert ev.query == "INSERT INTO t VALUES (1)"
+  assert ev.op == event.Op.Query
+  assert ev.outcome.rows() == 7
+}
+
+/// Poll until the proxy's listener accepts a dial, so the test doesn't race the
+/// bind. Deterministic bounded retry (no fixed sleep for correctness).
+fn wait_for_listen(addr: string) {
+  for _ in 0..100 {
+    match net.Dial("tcp", addr) {
+      Ok(c) => {
+        let _ = c.Close()
+        return
+      },
+      Err(_) => {
+        time.Sleep(5 * time.Millisecond)
+      },
+    }
+  }
+}
+
+/// Receive one event or fail after a bounded wait.
+fn receive_event(events: Channel<event.Event>) -> event.Event {
+  let timeout = time.After(3 * time.Second)
+  select {
+    let Some(ev) = events.receive() => ev,
+    let _ = timeout.receive() => event.Event {
+      op: event.Op.Query,
+      outcome: event.Outcome.Ok { rows_affected: -1 },
+      ..
+    },
+  }
+}

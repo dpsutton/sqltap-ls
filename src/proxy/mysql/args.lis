@@ -1,0 +1,125 @@
+import "go:encoding/binary"
+import "go:math"
+import "go:strconv"
+
+/// MySQL binary protocol field types (COM_STMT_EXECUTE parameter encoding).
+const MYSQL_TYPE_TINY: byte = 0x01
+
+const MYSQL_TYPE_SHORT: byte = 0x02
+
+const MYSQL_TYPE_LONG: byte = 0x03
+
+const MYSQL_TYPE_FLOAT: byte = 0x04
+
+const MYSQL_TYPE_DOUBLE: byte = 0x05
+
+const MYSQL_TYPE_NULL: byte = 0x06
+
+const MYSQL_TYPE_LONGLONG: byte = 0x08
+
+const MYSQL_TYPE_INT24: byte = 0x09
+
+const MYSQL_TYPE_YEAR: byte = 0x0d
+
+/// Extract parameter values from a COM_STMT_EXECUTE payload as their string
+/// representations. `payload` is the packet payload (starting at the command
+/// byte); `num_params` is the prepared statement's parameter count.
+///
+/// Layout after the command byte: stmt_id(4) + flags(1) + iteration_count(4),
+/// then (when num_params > 0) a NULL bitmap of (num_params+7)/8 bytes, a
+/// new-params-bound flag byte, optional type descriptors (2 bytes each), and
+/// the binary-encoded values in order. NULL params come from the bitmap and
+/// consume no value bytes. Any bounds failure yields "?" and stops, mirroring
+/// the Go reference exactly.
+pub fn parse_stmt_execute_args(payload: Slice<byte>, num_params: int) -> Slice<string> {
+  let mut args: Slice<string> = []
+  if num_params == 0 { return args }
+
+  // past command(1) + stmt_id(4) + flags(1) + iteration_count(4)
+  let mut off = 10
+  let null_bitmap_len = (num_params + 7) / 8
+  if off + null_bitmap_len + 1 > payload.length() { return args }
+
+  let null_bitmap = payload[off..off + null_bitmap_len]
+  off += null_bitmap_len
+
+  let bound_flag = payload[off]
+  off += 1
+
+  let mut types: Slice<byte> = []
+  for _ in 0..num_params {
+    types = types.append(0)
+  }
+
+  if bound_flag == 1 {
+    if off + num_params * 2 > payload.length() { return args }
+    for i in 0..num_params {
+      types[i] = payload[off + i * 2]
+      // payload[off + i*2 + 1] is the unsigned flag; ignored for display.
+    }
+    off += num_params * 2
+  }
+
+  for i in 0..num_params {
+    // NULL bitmap: bit (i%8) of byte (i/8).
+    let byte_idx = i / 8
+    let bit = (1 << (i % 8)) as byte
+    if (null_bitmap[byte_idx] & bit) != 0 {
+      args = args.append("NULL")
+      continue
+    }
+    let (val, n) = read_binary_value(payload, off, types[i])
+    args = args.append(val)
+    off += n
+  }
+
+  args
+}
+
+/// Read a single binary-encoded parameter value at `off`, returning its string
+/// form and the number of bytes consumed. On any bounds failure returns
+/// ("?", 0), matching the Go reference.
+fn read_binary_value(data: Slice<byte>, off: int, typ: byte) -> (string, int) {
+  if off >= data.length() { return ("?", 0) }
+
+  if typ == MYSQL_TYPE_TINY {
+    if off + 1 > data.length() { return ("?", 0) }
+    let v = data[off] as int8
+    (strconv.Itoa(v as int), 1)
+  } else if typ == MYSQL_TYPE_SHORT || typ == MYSQL_TYPE_YEAR {
+    if off + 2 > data.length() { return ("?", 0) }
+    let raw = binary.LittleEndian.Uint16(data[off..off + 2])
+    let v = raw as int16
+    (strconv.Itoa(v as int), 2)
+  } else if typ == MYSQL_TYPE_LONG || typ == MYSQL_TYPE_INT24 {
+    if off + 4 > data.length() { return ("?", 0) }
+    let raw = binary.LittleEndian.Uint32(data[off..off + 4])
+    let v = raw as int32
+    (strconv.FormatInt(v as int64, 10), 4)
+  } else if typ == MYSQL_TYPE_LONGLONG {
+    if off + 8 > data.length() { return ("?", 0) }
+    let raw = binary.LittleEndian.Uint64(data[off..off + 8])
+    let v = raw as int64
+    (strconv.FormatInt(v, 10), 8)
+  } else if typ == MYSQL_TYPE_FLOAT {
+    if off + 4 > data.length() { return ("?", 0) }
+    let bits = binary.LittleEndian.Uint32(data[off..off + 4])
+    let v = math.Float32frombits(bits)
+    (strconv.FormatFloat(v as float64, 0x67, -1, 32), 4)
+  } else if typ == MYSQL_TYPE_DOUBLE {
+    if off + 8 > data.length() { return ("?", 0) }
+    let bits = binary.LittleEndian.Uint64(data[off..off + 8])
+    let v = math.Float64frombits(bits)
+    (strconv.FormatFloat(v, 0x67, -1, 64), 8)
+  } else if typ == MYSQL_TYPE_NULL {
+    ("NULL", 0)
+  } else {
+    // String types: length-encoded string.
+    let (length, n) = read_lenenc_int(data, off)
+    if n == 0 { return ("?", 0) }
+    let start = off + n
+    let end = start + (length as int)
+    if end > data.length() { return ("?", 0) }
+    (data[start..end] as string, n + (length as int))
+  }
+}

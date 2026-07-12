@@ -1,0 +1,221 @@
+import "event"
+import "go:context"
+import "go:errors"
+import "go:log"
+import "go:net"
+import "go:time"
+
+/// A frame delivered to the single connection actor. Each reader task turns
+/// whole MySQL packets from one socket into `FromClient`/`FromUpstream` frames;
+/// when a socket closes it sends the matching `*Done` frame exactly once. The
+/// actor owns all capture state, so no locks are needed — this is the
+/// deliberate divergence from the Go original's two-goroutines-plus-mutex.
+enum Frame {
+  FromClient(Slice<byte>),
+  FromUpstream(Slice<byte>),
+  ClientDone,
+  UpstreamDone,
+}
+
+/// Accept MySQL client connections on `listen_addr`, relay each to
+/// `upstream_addr`, and publish captured query events on `events`. Blocks until
+/// `ctx` is cancelled (which unblocks the accept loop by closing the listener)
+/// or the listener fails.
+pub fn listen_and_serve(
+  ctx: context.Context,
+  listen_addr: string,
+  upstream_addr: string,
+  events: Channel<event.Event>,
+) -> Result<(), error> {
+  let listener = net.Listen("tcp", listen_addr).wrap_err("mysql: listen")?
+
+  // Watcher task: closing the listener unblocks Accept on cancellation.
+  task {
+    let _ = ctx.Done().receive()
+    let _ = listener.Close()
+  }
+
+  loop {
+    match listener.Accept() {
+      Ok(client_conn) => {
+        task { handle_conn(ctx, client_conn, upstream_addr, events) }
+      },
+      Err(e) => {
+        // A cancelled context means an orderly shutdown, not a failure.
+        if ctx.Err().is_some() {
+          return Ok(())
+        }
+        return Err(e).wrap_err("mysql: accept")
+      },
+    }
+  }
+}
+
+/// Dial the upstream, run the handshake, then relay the connection. Logs and
+/// returns on any error; never propagates, so one bad connection can't stop the
+/// accept loop.
+fn handle_conn(
+  ctx: context.Context,
+  client_conn: net.Conn,
+  upstream_addr: string,
+  events: Channel<event.Event>,
+) {
+  defer client_conn.Close()
+
+  let upstream_conn = match net.Dial("tcp", upstream_addr) {
+    Ok(c) => c,
+    Err(e) => {
+      log.Printf("mysql: dial upstream %s: %v", upstream_addr, e)
+      return
+    },
+  }
+  defer upstream_conn.Close()
+
+  // Scope a child context to this connection so the socket-closing watcher
+  // never outlives the connection it guards.
+  let (conn_ctx, cancel) = context.WithCancel(ctx)
+  defer cancel()
+
+  if let Err(e) = relay(conn_ctx, client_conn, upstream_conn, events) {
+    log.Printf("mysql: relay %v: %v", client_conn.RemoteAddr(), e)
+  }
+}
+
+/// Run the handshake, then the connection actor loop.
+fn relay(
+  ctx: context.Context,
+  client_conn: net.Conn,
+  upstream_conn: net.Conn,
+  events: Channel<event.Event>,
+) -> Result<(), error> {
+  relay_startup(client_conn, upstream_conn).wrap_err("mysql: startup")?
+
+  // One inbox for both sockets; the actor is the sole owner of capture state.
+  let frames = Channel.buffered<Frame>(64)
+
+  // Watcher: closing both sockets on cancellation unblocks the reader tasks.
+  task {
+    let _ = ctx.Done().receive()
+    let _ = client_conn.Close()
+    let _ = upstream_conn.Close()
+  }
+
+  // Reader task: client -> actor.
+  task {
+    loop {
+      match read_packet(client_conn) {
+        Ok(pkt) => {
+          if !frames.send(Frame.FromClient(pkt)) {
+            break
+          }
+        },
+        Err(_) => {
+          let _ = frames.send(Frame.ClientDone)
+          break
+        },
+      }
+    }
+  }
+
+  // Reader task: upstream -> actor.
+  task {
+    loop {
+      match read_packet(upstream_conn) {
+        Ok(pkt) => {
+          if !frames.send(Frame.FromUpstream(pkt)) {
+            break
+          }
+        },
+        Err(_) => {
+          let _ = frames.send(Frame.UpstreamDone)
+          break
+        },
+      }
+    }
+  }
+
+  let mut cap = Capture.new()
+  loop {
+    let Some(frame) = frames.receive() else {
+      return Ok(())
+    }
+    match frame {
+      Frame.FromClient(pkt) => {
+        cap.on_client_packet(pkt, time.Now())
+        let _ = write_packet(upstream_conn, pkt)
+      },
+      Frame.FromUpstream(pkt) => {
+        if let Some(ev) = cap.on_upstream_packet(pkt, time.Now()) {
+          emit_event(events, ev)
+        }
+        let _ = write_packet(client_conn, pkt)
+      },
+      Frame.ClientDone => {
+        let _ = upstream_conn.Close()
+        return Ok(())
+      },
+      Frame.UpstreamDone => {
+        let _ = client_conn.Close()
+        return Ok(())
+      },
+    }
+  }
+}
+
+/// Emit a finalized event without blocking the actor: drop it when the events
+/// channel is full, matching the Go original's non-blocking select.
+fn emit_event(events: Channel<event.Event>, ev: event.Event) {
+  select {
+    events.send(ev) => {},
+    _ => {},
+  }
+}
+
+/// Write a raw packet to `dst`.
+fn write_packet(dst: net.Conn, pkt: Slice<byte>) -> Result<(), error> {
+  match dst.Write(pkt) {
+    Partial.Ok(_) => Ok(()),
+    Partial.Err(e) => Err(e),
+    Partial.Both(_, e) => Err(e),
+  }
+}
+
+/// Run the MySQL handshake/auth phase, stripping unsupported capabilities from
+/// the server greeting and client response, then relaying auth packets until an
+/// OK or ERR from the upstream. Mirrors the Go reference exactly.
+fn relay_startup(client_conn: net.Conn, upstream_conn: net.Conn) -> Result<(), error> {
+  let strip = strip_caps()
+
+  // 1. Server greeting: strip unsupported capabilities.
+  let mut greeting = read_packet(upstream_conn).wrap_err("mysql: read greeting")?
+  let greeting2 = clear_capability_bits(greeting, strip)
+  write_packet(client_conn, greeting2).wrap_err("mysql: send greeting")?
+
+  // 2. Client handshake response: strip unsupported capabilities.
+  let mut resp = read_packet(client_conn).wrap_err("mysql: read handshake response")?
+  let resp2 = clear_client_capability_bits(resp, strip)
+  write_packet(upstream_conn, resp2).wrap_err("mysql: send handshake response")?
+
+  // 3. Relay auth packets until OK or ERR.
+  loop {
+    let pkt = read_packet(upstream_conn).wrap_err("mysql: read auth")?
+    write_packet(client_conn, pkt).wrap_err("mysql: send auth")?
+
+    let first = payload_byte(pkt)
+    if first == 0x00 {
+      return Ok(())
+    }
+    if first == 0xFF {
+      return Err(errors.New("mysql: auth error from upstream"))
+    }
+    // AuthMoreData: caching_sha2_password fast-auth success is [0x01, 0x03],
+    // followed by OK with no client response needed.
+    if first == 0x01 && pkt.length() >= 6 && pkt[5] == 0x03 {
+      continue
+    }
+
+    // Auth switch / other continuation: forward one client response.
+    let client_resp = read_packet(client_conn).wrap_err("mysql: read auth client response")?
+    write_packet(upstream_conn, client_resp).wrap_err("mysql: send auth client response")?
+  }
+}

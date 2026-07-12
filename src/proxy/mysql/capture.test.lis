@@ -1,0 +1,157 @@
+import "event"
+import "go:time"
+
+/// A fixed clock for deterministic capture tests.
+fn fixed_now() -> time.Time {
+  time.Date(2026, time.July, 12, 12, 0, 0, 0, time.UTC)
+}
+
+/// A COM_QUERY packet carrying `sql`.
+fn query_packet(sql: string) -> Slice<byte> {
+  let mut payload: Slice<byte> = [0x03]
+  for b in (sql as Slice<byte>) {
+    payload = payload.append(b)
+  }
+  make_packet(0, payload)
+}
+
+/// An OK response packet with a length-encoded affected-row count.
+fn ok_packet(rows: byte) -> Slice<byte> {
+  make_packet(1, [0x00, rows, 0x00, 0x02, 0x00])
+}
+
+/// An ERR response packet with sqlstate marker '#' and a message.
+fn err_packet(message: string) -> Slice<byte> {
+  // 0xFF errno(2) '#' sqlstate(5) message
+  let mut payload: Slice<byte> = [0xFF, 0x15, 0x04, 0x23, 0x34, 0x32, 0x30, 0x30, 0x30]
+  for b in (message as Slice<byte>) {
+    payload = payload.append(b)
+  }
+  make_packet(1, payload)
+}
+
+#[test("simple query finalizes on OK with affected rows")]
+fn test_capture_simple_query_ok() {
+  let mut cap = Capture.new()
+  cap.on_client_packet(query_packet("INSERT INTO t VALUES (1)"), fixed_now())
+
+  // No event yet — response is pending.
+  let mid = cap.on_upstream_packet(ok_packet(3), fixed_now())
+  let assert Some(ev) = mid
+  assert ev.query == "INSERT INTO t VALUES (1)"
+  assert ev.op == event.Op.Query
+  assert ev.outcome.rows() == 3
+  assert !ev.outcome.is_failed()
+}
+
+#[test("query error is captured from the ERR packet")]
+fn test_capture_query_error() {
+  let mut cap = Capture.new()
+  cap.on_client_packet(query_packet("SELECT bad"), fixed_now())
+
+  let out = cap.on_upstream_packet(err_packet("Unknown column"), fixed_now())
+  let assert Some(ev) = out
+  let assert Some(msg) = ev.outcome.error_message()
+  assert msg == "Unknown column"
+}
+
+#[test("SELECT result set finalizes on the row-data EOF")]
+fn test_capture_result_set() {
+  let mut cap = Capture.new()
+  cap.on_client_packet(query_packet("SELECT 1"), fixed_now())
+
+  // First response is a column-count packet (not OK/ERR): -> ColumnDefs.
+  let a = cap.on_upstream_packet(make_packet(1, [0x01]), fixed_now())
+  assert a.is_none()
+
+  // A column definition packet (arbitrary), then the column-defs EOF.
+  let b = cap.on_upstream_packet(make_packet(2, [0x03, 0x64, 0x65, 0x66]), fixed_now())
+  assert b.is_none()
+  let c = cap.on_upstream_packet(make_packet(3, [0xFE, 0x00, 0x00, 0x02, 0x00]), fixed_now())
+  assert c.is_none()
+
+  // One row, then the row-data EOF finalizes the result set.
+  let d = cap.on_upstream_packet(make_packet(4, [0x01, 0x31]), fixed_now())
+  assert d.is_none()
+  let e = cap.on_upstream_packet(make_packet(5, [0xFE, 0x00, 0x00, 0x02, 0x00]), fixed_now())
+  let assert Some(ev) = e
+  assert ev.query == "SELECT 1"
+  assert ev.outcome.rows() == 0
+}
+
+#[test("begin/commit assign and clear a transaction id")]
+fn test_capture_transaction() {
+  let mut cap = Capture.new()
+  cap.on_client_packet(query_packet("BEGIN"), fixed_now())
+  let begin = cap.on_upstream_packet(ok_packet(0), fixed_now())
+  let assert Some(bev) = begin
+  assert bev.op == event.Op.Begin
+  let assert Some(tx) = bev.tx_id
+
+  cap.on_client_packet(query_packet("SELECT 1"), fixed_now())
+  // SELECT sends a column-count first; drive it to a result set.
+  let _ = cap.on_upstream_packet(make_packet(1, [0x01]), fixed_now())
+  let _ = cap.on_upstream_packet(make_packet(2, [0xFE, 0x00, 0x00, 0x02, 0x00]), fixed_now())
+  let mid = cap.on_upstream_packet(make_packet(3, [0xFE, 0x00, 0x00, 0x02, 0x00]), fixed_now())
+  let assert Some(mev) = mid
+  let assert Some(mtx) = mev.tx_id
+  assert mtx == tx
+
+  cap.on_client_packet(query_packet("COMMIT"), fixed_now())
+  let commit = cap.on_upstream_packet(ok_packet(0), fixed_now())
+  let assert Some(cev) = commit
+  assert cev.op == event.Op.Commit
+  let assert Some(ctx) = cev.tx_id
+  assert ctx == tx
+}
+
+#[test("prepared statement metadata drives execute arg parsing")]
+fn test_capture_prepared_execute() {
+  let mut cap = Capture.new()
+
+  // Client prepares "SELECT ? + ?".
+  let mut prep_payload: Slice<byte> = [0x16]
+  for b in ("SELECT ? + ?" as Slice<byte>) {
+    prep_payload = prep_payload.append(b)
+  }
+  cap.on_client_packet(make_packet(0, prep_payload), fixed_now())
+
+  // Server replies COM_STMT_PREPARE_OK: status,stmt_id=1,num_columns=1,num_params=2,reserved,warnings
+  let prepare_ok: Slice<byte> = [
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+  ]
+  let r = cap.on_upstream_packet(make_packet(1, prepare_ok), fixed_now())
+  assert r.is_none()
+
+  // Skip 2 param defs + EOF (3) and 1 column def + EOF (2) = 5 packets.
+  for i in 0..5 {
+    let s = cap.on_upstream_packet(make_packet((i + 2) as byte, [0x03, 0x64]), fixed_now())
+    assert s.is_none()
+  }
+
+  // Client executes stmt 1 with two longlong args 1 and 2.
+  let mut exec: Slice<byte> = [0x17, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]
+  exec = exec.append(0x00) // null bitmap
+  exec = exec.append(0x01) // new-params-bound
+  exec = exec.append(0x08) // longlong type
+  exec = exec.append(0x00)
+  exec = exec.append(0x08)
+  exec = exec.append(0x00)
+  let arg1: Slice<byte> = [1, 0, 0, 0, 0, 0, 0, 0]
+  for b in arg1 {
+    exec = exec.append(b)
+  }
+  let arg2: Slice<byte> = [2, 0, 0, 0, 0, 0, 0, 0]
+  for b in arg2 {
+    exec = exec.append(b)
+  }
+  cap.on_client_packet(make_packet(0, exec), fixed_now())
+
+  let done = cap.on_upstream_packet(ok_packet(0), fixed_now())
+  let assert Some(ev) = done
+  assert ev.op == event.Op.Execute
+  assert ev.query == "SELECT ? + ?"
+  assert ev.args.length() == 2
+  assert ev.args[0] == "1"
+  assert ev.args[1] == "2"
+}

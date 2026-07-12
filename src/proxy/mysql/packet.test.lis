@@ -1,0 +1,62 @@
+#[test("lenenc int decodes all four width classes")]
+fn test_lenenc_int() {
+  // 1-byte literal (< 0xFB)
+  let (v0, n0) = read_lenenc_int([0x05], 0)
+  assert v0 == 5
+  assert n0 == 1
+
+  // 0xFC prefix -> 2-byte LE
+  let (v1, n1) = read_lenenc_int([0xFC, 0x34, 0x12], 0)
+  assert v1 == 0x1234
+  assert n1 == 3
+
+  // 0xFD prefix -> 3-byte LE
+  let (v2, n2) = read_lenenc_int([0xFD, 0x01, 0x02, 0x03], 0)
+  assert v2 == 0x030201
+  assert n2 == 4
+
+  // 0xFE prefix -> 8-byte LE
+  let (v3, n3) = read_lenenc_int([0xFE, 0x01, 0, 0, 0, 0, 0, 0, 0], 0)
+  assert v3 == 1
+  assert n3 == 9
+}
+
+#[test("lenenc int reports truncation as zero consumed")]
+fn test_lenenc_int_truncated() {
+  let (_, n) = read_lenenc_int([0xFC, 0x34], 0)
+  assert n == 0
+
+  let (_, empty) = read_lenenc_int([], 0)
+  assert empty == 0
+}
+
+#[test("eof packet detection uses first byte and length")]
+fn test_is_eof_packet() {
+  // EOF: 0xFE with short payload
+  let eof = make_packet(1, [0xFE, 0x00, 0x00, 0x02, 0x00])
+  assert is_eof_packet(eof)
+
+  // 0xFE but long payload (>= 9) is a lenenc column count, not EOF
+  let mut long_payload: Slice<byte> = [0xFE]
+  for _ in 0..10 {
+    long_payload = long_payload.append(0x41)
+  }
+  let not_eof = make_packet(1, long_payload)
+  assert !is_eof_packet(not_eof)
+
+  // OK packet first byte 0x00 is not EOF
+  let ok = make_packet(1, [0x00, 0x00, 0x00, 0x02, 0x00])
+  assert !is_eof_packet(ok)
+}
+
+#[test("payload_byte and payload_len read the header")]
+fn test_payload_accessors() {
+  let pkt = make_packet(7, [0x03, 0x41, 0x42])
+  assert payload_byte(pkt) == 0x03
+  assert payload_len(pkt) == 3
+
+  // No payload
+  let empty = make_packet(0, [])
+  assert payload_byte(empty) == 0
+  assert payload_len(empty) == 0
+}
