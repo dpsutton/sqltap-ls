@@ -5,6 +5,8 @@ import "go:os/signal"
 import "go:syscall"
 
 import "ci"
+import "daemon"
+import "tui"
 
 const VERSION = "0.1.0"
 
@@ -33,14 +35,37 @@ fn main() {
   }
 }
 
+/// Run the proxy daemon until SIGINT/SIGTERM.
+#[allow(lost_cancel)]
 fn run_serve(args: Slice<string>) {
-  fmt.Fprintln(os.Stderr, "serve: not wired yet")
-  os.Exit(1)
+  match daemon.parse_serve(args, os.Stderr) {
+    daemon.ServeCommand.ShowVersion => {
+      fmt.Println(f"sqltap {VERSION}")
+    },
+    daemon.ServeCommand.Invalid { message } => {
+      fmt.Fprintln(os.Stderr, f"sqltap serve: {message}")
+      os.Exit(1)
+    },
+    daemon.ServeCommand.Run(cfg) => {
+      let (ctx, _) = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+      if let Err(e) = daemon.run(ctx, cfg) {
+        fmt.Fprintln(os.Stderr, f"sqltap serve: {e}")
+        os.Exit(1)
+      }
+    },
+  }
 }
 
+/// Watch traffic in the interactive TUI.
 fn run_watch(args: Slice<string>) {
-  fmt.Fprintln(os.Stderr, "watch: not wired yet")
-  os.Exit(1)
+  if args.length() < 1 {
+    usage()
+    os.Exit(1)
+  }
+  if let Err(e) = tui.watch(args[0]) {
+    fmt.Fprintln(os.Stderr, f"Error: {e}")
+    os.Exit(1)
+  }
 }
 
 /// CI mode: collect events until the signal context is cancelled or the

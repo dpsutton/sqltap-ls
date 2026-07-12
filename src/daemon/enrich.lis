@@ -57,24 +57,24 @@ impl Enricher {
     Enricher { detector, slow_threshold }
   }
 
-  pub fn enrich(self: Ref<Enricher>, mut ev: event.Event) -> Enriched {
-    if ev.query != "" {
-      ev.normalized_query = query.normalize(ev.query)
-    }
+  pub fn enrich(self: Ref<Enricher>, ev: event.Event) -> Enriched {
+    let normalized = if ev.query != "" { query.normalize(ev.query) } else { "" }
 
+    let mut nplus1 = ev.nplus1
     let mut alert: Option<detect.Alert> = None
     if let Some(det) = self.detector {
       if is_select_query(ev.op, ev.query) {
         let result = det.record(ev.query, ev.start_time)
-        ev.nplus1 = result.matched
+        nplus1 = result.matched
         alert = result.alert
       }
     }
 
-    if (self.slow_threshold as int64) > 0 && ev.duration >= self.slow_threshold {
-      ev.slow = true
-    }
+    let slow = (self.slow_threshold as int64) > 0 && ev.duration >= self.slow_threshold
 
-    Enriched { ev, alert }
+    Enriched {
+      ev: event.Event { normalized_query: normalized, nplus1, slow, ..ev },
+      alert,
+    }
   }
 }

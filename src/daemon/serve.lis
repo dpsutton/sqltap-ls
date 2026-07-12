@@ -1,0 +1,107 @@
+import "go:context"
+import "go:errors"
+import "go:database/sql"
+import "go:log"
+import "go:net"
+import "go:os"
+import "go:time"
+
+import "broker"
+import "config"
+import "detect"
+import "dsn"
+import "event"
+import "explain"
+import "proxy/mysql"
+import "proxy/postgres"
+import "server"
+
+/// Assemble and run the daemon: wire proxy -> enrichment -> broker -> HTTP
+/// server(s), then block on the proxy accept loop until `ctx` is cancelled.
+pub fn run(ctx: context.Context, cfg: config.Config) -> Result<(), error> {
+  let Some(driver) = cfg.driver else {
+    return Err(errors.New("daemon: driver is required"))
+  }
+
+  let mut b = broker.Broker.new(256)
+
+  // EXPLAIN client (optional): enabled when the DSN env var is set.
+  let raw_dsn = os.Getenv(cfg.dsn_env)
+  let explain_client = if raw_dsn == "" {
+    log.Print(f"EXPLAIN disabled ({cfg.dsn_env} not set)")
+    None
+  } else {
+    let client = open_explain(raw_dsn, driver).wrap_err("open db for explain")?
+    log.Printf("EXPLAIN enabled")
+    Some(client)
+  }
+
+  // HTTP API server (browser UI + SSE + explain), on the API address and
+  // optionally on a second web address.
+  let srv = server.Server.new(&b, explain_client)
+  serve_http(ctx, srv, cfg.api_addr)?
+  log.Print(f"HTTP API listening on {cfg.api_addr}")
+  if cfg.http != "" {
+    serve_http(ctx, srv, cfg.http)?
+    log.Print(f"web UI listening on {cfg.http}")
+  }
+
+  // Enrichment pump: proxy events -> normalize/N+1/slow -> broker.
+  let events = Channel.buffered<event.Event>(256)
+  let nplus1 = cfg.nplus1
+  let slow_threshold = cfg.slow_threshold
+  if nplus1.threshold > 0 {
+    log.Print(f"N+1 detection enabled (threshold={nplus1.threshold}, window={nplus1.window}, cooldown={nplus1.cooldown})")
+  }
+  if (slow_threshold as int64) > 0 {
+    log.Print(f"slow query detection enabled (threshold={slow_threshold})")
+  }
+  task {
+    let mut detector = detect.Detector.new(nplus1.threshold, nplus1.window, nplus1.cooldown)
+    let det = if nplus1.threshold > 0 { Some(&detector) } else { None }
+    let mut enricher = Enricher.new(det, slow_threshold)
+    for ev in events {
+      let enriched = enricher.enrich(ev)
+      if let Some(alert) = enriched.alert {
+        log.Print(f"N+1 detected: '{alert.query}' ({alert.count} times in {nplus1.window})")
+      }
+      b.publish(enriched.ev)
+    }
+  }
+
+  log.Print(f"proxying {cfg.listen} -> {cfg.upstream} (driver={driver})")
+  match driver {
+    config.Driver.Postgres => postgres.listen_and_serve(ctx, cfg.listen, cfg.upstream, events),
+    config.Driver.Mysql | config.Driver.Tidb => mysql.listen_and_serve(ctx, cfg.listen, cfg.upstream, events),
+  }
+}
+
+/// Open the EXPLAIN database connection for the captured-traffic dialect.
+fn open_explain(raw: string, driver: config.Driver) -> Result<explain.Client, error> {
+  let sql_driver = dsn.detect(raw)?
+  let db = sql.Open(sql_driver.driver_name(), dsn.open_dsn(sql_driver, raw))?
+  let dialect = match driver {
+    config.Driver.Postgres => explain.Dialect.Postgres,
+    config.Driver.Mysql => explain.Dialect.Mysql,
+    config.Driver.Tidb => explain.Dialect.Tidb,
+  }
+  Ok(explain.Client.new(db, dialect))
+}
+
+/// Start `srv` on `addr` in a background task, shutting down gracefully
+/// (5s deadline) when `ctx` is cancelled.
+fn serve_http(ctx: context.Context, srv: server.Server, addr: string) -> Result<(), error> {
+  let lis = net.Listen("tcp", addr).wrap_err(f"listen {addr}")?
+  task {
+    if let Err(e) = srv.serve(lis) {
+      log.Print(f"http serve {addr}: {e}")
+    }
+  }
+  task {
+    let _ = ctx.Done().receive()
+    let (shutdown_ctx, cancel) = context.WithTimeout(context.Background(), 5 * time.Second)
+    defer cancel()
+    let _ = srv.shutdown(shutdown_ctx)
+  }
+  Ok(())
+}
