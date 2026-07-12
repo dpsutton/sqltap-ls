@@ -1,0 +1,84 @@
+import "go:strings"
+
+// --- plan() --------------------------------------------------------------
+
+#[test("plan bolds a node name and faints its metrics")]
+fn test_plan_node_line() {
+  let line = "  ->  Seq Scan on users  (cost=0.00..1.10 rows=10 width=4)"
+  let out = plan(line)
+  // node name rendered bold
+  assert out.contains(f"{BOLD}Seq Scan{RESET}")
+  // metrics parenthetical rendered faint
+  assert out.contains(f"{FAINT}(cost=0.00..1.10 rows=10 width=4){RESET}")
+  // arrow rendered faint
+  assert out.contains(f"{FAINT}->{RESET}")
+}
+
+#[test("plan renders a summary line fully bold and skips other styling")]
+fn test_plan_summary_line() {
+  let line = "Planning Time: 0.123 ms"
+  let out = plan(line)
+  assert out == f"{BOLD}Planning Time: 0.123 ms{RESET}"
+  // must not have applied node/metric styling inside the summary
+  assert !out.contains(FAINT)
+}
+
+#[test("plan preserves multiple lines")]
+fn test_plan_multiline() {
+  let text = "Execution Time: 1.0 ms\n  -> Sort"
+  let out = plan(text)
+  let lines = strings.Split(out, "\n")
+  assert lines.length() == 2
+  assert lines[0] == f"{BOLD}Execution Time: 1.0 ms{RESET}"
+  assert lines[1].contains(f"{BOLD}Sort{RESET}")
+}
+
+#[test("plan leaves empty input unchanged")]
+fn test_plan_empty() {
+  assert plan("") == ""
+}
+
+// --- sql() ---------------------------------------------------------------
+
+#[test("sql colors a keyword case-insensitively")]
+fn test_sql_keyword() {
+  let out = sql("select 1")
+  assert out.contains(f"{KEYWORD}select{RESET}")
+}
+
+#[test("sql colors a string literal with escaped quote")]
+fn test_sql_string_escape() {
+  let out = sql("WHERE name = 'O''Brien'")
+  // the whole literal including the escaped '' stays one styled token
+  assert out.contains(f"{STRING}'O''Brien'{RESET}")
+  assert out.contains(f"{KEYWORD}WHERE{RESET}")
+}
+
+#[test("sql colors a numeric literal")]
+fn test_sql_number() {
+  let out = sql("LIMIT 42")
+  assert out.contains(f"{NUMBER}42{RESET}")
+}
+
+#[test("sql colors a $N parameter")]
+fn test_sql_param() {
+  let out = sql("id = $1")
+  assert out.contains(f"{PARAM}$1{RESET}")
+}
+
+#[test("sql leaves empty input unchanged")]
+fn test_sql_empty() {
+  assert sql("") == ""
+}
+
+#[test("sql leaves plain identifiers untouched")]
+fn test_sql_identifier() {
+  let out = sql("users")
+  assert out == "users"
+}
+
+#[test("sql does not panic on unterminated string")]
+fn test_sql_unterminated() {
+  let out = sql("WHERE x = 'oops")
+  assert out.contains(f"{STRING}'oops{RESET}")
+}

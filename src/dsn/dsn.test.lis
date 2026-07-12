@@ -1,0 +1,46 @@
+#[test("postgres URI detects Pgx")]
+fn test_postgres_uri() {
+  let assert Ok(d) = detect("postgres://user:pass@localhost/db")
+  assert d == SqlDriver.Pgx
+}
+
+#[test("postgresql URI detects Pgx")]
+fn test_postgresql_uri() {
+  let assert Ok(d) = detect("postgresql://user:pass@localhost/db")
+  assert d == SqlDriver.Pgx
+}
+
+#[test("postgres key=value detects Pgx")]
+fn test_postgres_kv() {
+  let assert Ok(d) = detect("host=localhost dbname=db")
+  assert d == SqlDriver.Pgx
+}
+
+#[test("mysql user@tcp detects Mysql")]
+fn test_mysql() {
+  let assert Ok(d) = detect("user:pass@tcp(localhost:3306)/db")
+  assert d == SqlDriver.Mysql
+}
+
+#[test("empty DSN errors")]
+fn test_empty() {
+  let assert Err(_) = detect("")
+}
+
+#[test("unknown DSN errors")]
+fn test_unknown() {
+  let assert Err(_) = detect("foobar")
+}
+
+#[test("driver names match database/sql")]
+fn test_driver_names() {
+  assert SqlDriver.Pgx.driver_name() == "pgx"
+  assert SqlDriver.Mysql.driver_name() == "mysql"
+}
+
+#[test("open_dsn strips mysql:// only for Mysql")]
+fn test_open_dsn() {
+  assert open_dsn(SqlDriver.Mysql, "mysql://user@tcp(x)/db") == "user@tcp(x)/db"
+  assert open_dsn(SqlDriver.Mysql, "user@tcp(x)/db") == "user@tcp(x)/db"
+  assert open_dsn(SqlDriver.Pgx, "postgres://u@h/db") == "postgres://u@h/db"
+}

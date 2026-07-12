@@ -1,0 +1,63 @@
+import "go:context"
+import "go:errors"
+import "go:os/exec"
+import "go:runtime"
+import "go:strings"
+
+/// The command and arguments used to write to the system clipboard.
+/// `name` is the executable, `args` the trailing arguments (may be empty).
+pub struct CopyCmd {
+  pub name: string,
+  pub args: Slice<string>,
+}
+
+/// Choose the clipboard command for a platform, given whether the Linux
+/// helpers are installed. Pure so every branch is unit-testable:
+///
+///   - darwin  -> pbcopy
+///   - linux   -> xclip -selection clipboard, else xsel --clipboard --input,
+///                else error (neither helper installed)
+///   - windows -> clip.exe
+///   - other   -> error naming the platform
+pub fn select_cmd(
+  goos: string,
+  has_xclip: bool,
+  has_xsel: bool,
+) -> Result<CopyCmd, error> {
+  match goos {
+    "darwin" => Ok(CopyCmd { name: "pbcopy", args: [] }),
+    "linux" => {
+      if has_xclip {
+        Ok(CopyCmd { name: "xclip", args: ["-selection", "clipboard"] })
+      } else if has_xsel {
+        Ok(CopyCmd { name: "xsel", args: ["--clipboard", "--input"] })
+      } else {
+        Err(errors.New("xclip or xsel is required on Linux"))
+      }
+    },
+    "windows" => Ok(CopyCmd { name: "clip.exe", args: [] }),
+    _ => Err(errors.New(f"clipboard not supported on {goos}")),
+  }
+}
+
+/// True when `name` is found on PATH.
+fn has_command(name: string) -> bool {
+  match exec.LookPath(name) {
+    Partial.Ok(_) => true,
+    Partial.Both(_, _) => true,
+    Partial.Err(_) => false,
+  }
+}
+
+/// Write text to the system clipboard, selecting the platform command and
+/// feeding `text` on stdin. Run errors are wrapped.
+pub fn copy(ctx: context.Context, text: string) -> Result<(), error> {
+  let has_xclip = has_command("xclip")
+  let has_xsel = has_command("xsel")
+  let selected = select_cmd(runtime.GOOS, has_xclip, has_xsel)?
+
+  let mut cmd = exec.CommandContext(ctx, selected.name, selected.args...)
+  cmd.Stdin = Some(strings.NewReader(text))
+  cmd.Run().wrap_err("clipboard copy")?
+  Ok(())
+}

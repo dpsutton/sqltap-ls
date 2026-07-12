@@ -1,0 +1,41 @@
+#[test("darwin uses pbcopy")]
+fn test_darwin() {
+  let assert Ok(cmd) = select_cmd("darwin", false, false)
+  assert cmd.name == "pbcopy"
+  assert cmd.args.is_empty()
+}
+
+#[test("linux prefers xclip")]
+fn test_linux_xclip() {
+  let assert Ok(cmd) = select_cmd("linux", true, true)
+  assert cmd.name == "xclip"
+  assert cmd.args.length() == 2
+  assert cmd.args[0] == "-selection"
+  assert cmd.args[1] == "clipboard"
+}
+
+#[test("linux falls back to xsel")]
+fn test_linux_xsel() {
+  let assert Ok(cmd) = select_cmd("linux", false, true)
+  assert cmd.name == "xsel"
+  assert cmd.args.length() == 2
+  assert cmd.args[0] == "--clipboard"
+  assert cmd.args[1] == "--input"
+}
+
+#[test("linux with no helper errors")]
+fn test_linux_none() {
+  let assert Err(_) = select_cmd("linux", false, false)
+}
+
+#[test("windows uses clip.exe")]
+fn test_windows() {
+  let assert Ok(cmd) = select_cmd("windows", false, false)
+  assert cmd.name == "clip.exe"
+  assert cmd.args.is_empty()
+}
+
+#[test("unsupported OS errors")]
+fn test_other() {
+  let assert Err(_) = select_cmd("plan9", true, true)
+}

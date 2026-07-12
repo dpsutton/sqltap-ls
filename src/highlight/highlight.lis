@@ -1,0 +1,186 @@
+import "go:regexp"
+import "go:strings"
+
+// ANSI escape sequences. Styled tokens are reset with RESET after the text.
+const RESET = "\x1b[0m"
+const BOLD = "\x1b[1m"
+const FAINT = "\x1b[2m"
+
+// Monokai-ish 256-color palette for the SQL highlighter.
+const KEYWORD = "\x1b[38;5;204m" // pink
+const STRING = "\x1b[38;5;186m" // yellow-green
+const NUMBER = "\x1b[38;5;141m" // purple
+const PARAM = "\x1b[38;5;81m" // cyan
+
+/// Wrap `text` in an ANSI style, resetting afterward.
+fn styled(code: string, text: string) -> string {
+  f"{code}{text}{RESET}"
+}
+
+// --- Plan highlighting ---------------------------------------------------
+
+// Plan-node names, verbatim from the Go source alternation list.
+const NODE_PATTERN = r"(?i)\b(Seq Scan|Index Scan|Index Only Scan|Bitmap Heap Scan|Bitmap Index Scan|Incremental Sort|Sort|Hash Join|Merge Join|Nested Loop|Hash|WindowAgg|Aggregate|Group|Limit|Unique|Gather Merge|Gather|Materialize|Append|Result|Subquery Scan|CTE Scan|Function Scan|Values Scan|LockRows|SetOp|ModifyTable|Table scan|Index lookup|Covering index|Full scan|ref|range|ALL|index|const)\b"
+
+const METRICS_PATTERN = r"\((?:cost|actual time|loops|width|never executed)[^)]*\)"
+const ARROW_PATTERN = "->"
+const SUMMARY_PATTERN = r"(?i)^\s*(Planning Time|Execution Time|Query time):"
+
+fn node_re() -> Ref<regexp.Regexp> {
+  regexp.MustCompile(NODE_PATTERN)
+}
+
+fn metrics_re() -> Ref<regexp.Regexp> {
+  regexp.MustCompile(METRICS_PATTERN)
+}
+
+fn arrow_re() -> Ref<regexp.Regexp> {
+  regexp.MustCompile(ARROW_PATTERN)
+}
+
+fn summary_re() -> Ref<regexp.Regexp> {
+  regexp.MustCompile(SUMMARY_PATTERN)
+}
+
+/// Highlight an EXPLAIN plan. Node names are bold, metrics and arrows are
+/// faint, and summary lines (Planning/Execution/Query time) are fully bold.
+/// Empty input is returned unchanged.
+pub fn plan(s: string) -> string {
+  if s == "" {
+    return s
+  }
+
+  let node = node_re()
+  let metrics = metrics_re()
+  let arrow = arrow_re()
+  let summary = summary_re()
+
+  let lines = strings.Split(s, "\n")
+  let styled_lines = lines.map(|line| {
+    if summary.MatchString(line) {
+      styled(BOLD, line)
+    } else {
+      let a = arrow.ReplaceAllStringFunc(line, |m| styled(FAINT, m))
+      let b = metrics.ReplaceAllStringFunc(a, |m| styled(FAINT, m))
+      node.ReplaceAllStringFunc(b, |m| styled(BOLD, m))
+    }
+  })
+  strings.Join(styled_lines, "\n")
+}
+
+// --- SQL highlighting ----------------------------------------------------
+
+/// The SQL keywords rendered in the keyword color (matched case-insensitively).
+fn keywords() -> Slice<string> {
+  [
+    "SELECT", "FROM", "WHERE", "INSERT", "INTO", "UPDATE", "DELETE", "JOIN",
+    "LEFT", "RIGHT", "INNER", "OUTER", "FULL", "CROSS", "ON", "AND", "OR",
+    "NOT", "NULL", "IN", "AS", "ORDER", "BY", "GROUP", "HAVING", "LIMIT",
+    "OFFSET", "VALUES", "SET", "BEGIN", "COMMIT", "ROLLBACK", "START",
+    "TRANSACTION", "CREATE", "TABLE", "INDEX", "DROP", "ALTER", "UNION", "ALL",
+    "DISTINCT", "CASE", "WHEN", "THEN", "ELSE", "END", "LIKE", "ILIKE",
+    "BETWEEN", "IS", "ASC", "DESC", "EXISTS", "RETURNING", "WITH",
+  ]
+}
+
+/// True when `word` is a SQL keyword, compared case-insensitively.
+fn is_keyword(word: string) -> bool {
+  let upper = strings.ToUpper(word)
+  keywords().contains(upper)
+}
+
+/// Substring of `s` over byte indices [lo, hi), reusing an already-computed
+/// byte view. Works on byte boundaries, which is all this tokenizer needs.
+fn substr(bytes: Slice<byte>, lo: int, hi: int) -> string {
+  let mut buf: Slice<byte> = []
+  let mut k = lo
+  while k < hi {
+    buf = buf.append(bytes[k])
+    k += 1
+  }
+  buf as string
+}
+
+fn is_digit(c: byte) -> bool {
+  c >= 48 && c <= 57 // '0'..'9'
+}
+
+fn is_ident_byte(c: byte) -> bool {
+  let lower = c >= 97 && c <= 122 // a-z
+  let upper = c >= 65 && c <= 90 // A-Z
+  let digit = is_digit(c)
+  lower || upper || digit || c == 95 // '_'
+}
+
+/// Highlight a SQL statement with ANSI colors. Single-pass tokenizer over
+/// byte boundaries: keywords, single-quoted strings ('' escape aware),
+/// numeric literals, and $N parameters are colored; everything else is
+/// emitted verbatim. Empty input is returned unchanged. Never panics.
+pub fn sql(s: string) -> string {
+  if s == "" {
+    return s
+  }
+
+  let bytes = s.bytes()
+  let n = bytes.length()
+  let mut out = ""
+  let mut i = 0
+
+  while i < n {
+    let c = bytes[i]
+
+    if c == 39 { // single quote: string literal
+      let mut j = i + 1
+      while j < n {
+        if bytes[j] == 39 {
+          if j + 1 < n && bytes[j + 1] == 39 {
+            j += 2 // escaped '' — consume both, stay inside the literal
+          } else {
+            j += 1 // closing quote
+            break
+          }
+        } else {
+          j += 1
+        }
+      }
+      out += styled(STRING, substr(bytes, i, j))
+      i = j
+    } else if c == 36 { // '$' — parameter placeholder $N
+      let mut j = i + 1
+      while j < n && is_digit(bytes[j]) {
+        j += 1
+      }
+      if j > i + 1 {
+        out += styled(PARAM, substr(bytes, i, j))
+        i = j
+      } else {
+        out += "$"
+        i += 1
+      }
+    } else if is_digit(c) { // numeric literal
+      let mut j = i
+      while j < n && (is_digit(bytes[j]) || bytes[j] == 46) { // digits and '.'
+        j += 1
+      }
+      out += styled(NUMBER, substr(bytes, i, j))
+      i = j
+    } else if is_ident_byte(c) { // word — keyword or identifier
+      let mut j = i
+      while j < n && is_ident_byte(bytes[j]) {
+        j += 1
+      }
+      let word = substr(bytes, i, j)
+      if is_keyword(word) {
+        out += styled(KEYWORD, word)
+      } else {
+        out += word
+      }
+      i = j
+    } else { // punctuation / whitespace — verbatim
+      out += substr(bytes, i, i + 1)
+      i += 1
+    }
+  }
+
+  out
+}
