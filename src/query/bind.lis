@@ -1,0 +1,67 @@
+import "go:strconv"
+import "go:strings"
+
+/// Replaces placeholders in a SQL query with the provided args, quoting each
+/// arg as needed. Supports PostgreSQL-style (`$1`, `$2`, ...) and MySQL-style
+/// (`?`) placeholders.
+///
+/// With no args the query is returned unchanged. PostgreSQL-style is tried
+/// first: every `$N` is replaced (in reverse index order, so `$1` cannot
+/// clobber `$10`); if any replacement happened the result is returned.
+/// Otherwise MySQL-style `?` placeholders are filled left-to-right with args
+/// until the args are exhausted.
+pub fn bind(sql: string, args: Slice<string>) -> string {
+  if args.is_empty() {
+    return sql
+  }
+
+  let quoted = args.map(quote_arg)
+
+  // Try PostgreSQL-style first: $1, $2, ... Replace in reverse index order so
+  // $1 does not match inside $10.
+  let mut pg = sql
+  let mut replaced = false
+  let mut idx = quoted.length()
+  while idx >= 1 {
+    let placeholder = f"${idx}"
+    if strings.Contains(pg, placeholder) {
+      replaced = true
+      pg = strings.ReplaceAll(pg, placeholder, quoted[idx - 1])
+    }
+    idx -= 1
+  }
+  if replaced {
+    return pg
+  }
+
+  // Fall back to MySQL-style: ? filled left-to-right.
+  let bytes = sql.bytes()
+  let n = bytes.length()
+  let mut out: Slice<byte> = []
+  let mut arg_idx = 0
+  for i in 0..n {
+    if bytes[i] == 63 && arg_idx < quoted.length() { // '?'
+      for b in quoted[arg_idx].bytes() {
+        out = out.append(b)
+      }
+      arg_idx += 1
+    } else {
+      out = out.append(bytes[i])
+    }
+  }
+  out as string
+}
+
+/// Wraps a non-numeric arg in single quotes, doubling any internal quote.
+/// Values parseable as a float, and the literals `true`/`false`/`null`/`NULL`,
+/// are left bare.
+fn quote_arg(s: string) -> string {
+  if let Ok(_) = strconv.ParseFloat(s, 64) {
+    return s
+  }
+  if s == "true" || s == "false" || s == "null" || s == "NULL" {
+    return s
+  }
+  let escaped = strings.ReplaceAll(s, "'", "''")
+  f"'{escaped}'"
+}

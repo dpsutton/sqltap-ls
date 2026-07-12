@@ -1,0 +1,63 @@
+/// Table-driven port of the Go `TestNormalize` cases, plus a few edge cases.
+#[test("normalize replaces literals with placeholders")]
+fn test_normalize(t: TestContext) {
+  let cases = [
+    ("empty", "", ""),
+    (
+      "string literal",
+      "SELECT id FROM users WHERE name = 'alice'",
+      "SELECT id FROM users WHERE name = '?'",
+    ),
+    ("escaped quote", "WHERE name = 'it''s'", "WHERE name = '?'"),
+    (
+      "numeric literal",
+      "SELECT id, name FROM users WHERE id = 42",
+      "SELECT id, name FROM users WHERE id = ?",
+    ),
+    ("float literal", "WHERE score > 3.14", "WHERE score > ?"),
+    (
+      "pg param kept",
+      "WHERE id = $1 AND name = $2",
+      "WHERE id = $1 AND name = $2",
+    ),
+    ("in list", "WHERE id IN (1, 2, 3)", "WHERE id IN (?, ?, ?)"),
+    (
+      "mixed",
+      "WHERE id = 42 AND name = 'bob' AND status = $1",
+      "WHERE id = ? AND name = '?' AND status = $1",
+    ),
+    ("whitespace collapse", "SELECT  id\n\tFROM  users", "SELECT id FROM users"),
+    ("leading trailing space", "  SELECT 1  ", "SELECT ?"),
+    ("no replace in identifier", "SELECT t1.id FROM t1", "SELECT t1.id FROM t1"),
+    ("negative number", "WHERE x = -5", "WHERE x = -?"),
+    (
+      "multiple string literals",
+      "INSERT INTO t (a, b) VALUES ('x', 'y')",
+      "INSERT INTO t (a, b) VALUES ('?', '?')",
+    ),
+  ]
+
+  for (name, input, want) in cases {
+    t.run(name, |_| {
+      let got = normalize(input)
+      assert got == want
+    })
+  }
+}
+
+/// Edge cases beyond the Go suite that exercise boundary behavior.
+#[test("normalize edge cases")]
+fn test_normalize_edges(t: TestContext) {
+  // Empty string literal collapses to '?'.
+  assert normalize("WHERE name = ''") == "WHERE name = '?'"
+  // A number followed directly by an identifier char is not standalone.
+  assert normalize("SELECT 1abc") == "SELECT 1abc"
+  // Trailing digits at end of input are still normalized.
+  assert normalize("LIMIT 100") == "LIMIT ?"
+  // $ not followed by a digit is copied verbatim.
+  assert normalize("SELECT $foo") == "SELECT $foo"
+  // Only whitespace collapses to empty (no leading space, trailing trimmed).
+  assert normalize("   ") == ""
+  // Dotted numeric literal is one placeholder.
+  assert normalize("(3.14, 2.0)") == "(?, ?)"
+}

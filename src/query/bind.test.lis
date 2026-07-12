@@ -1,0 +1,108 @@
+/// Table-driven port of the Go `TestBind` cases, plus a few edge cases.
+struct BindCase {
+  name: string,
+  sql: string,
+  args: Slice<string>,
+  want: string,
+}
+
+#[test("bind fills placeholders and quotes args")]
+fn test_bind(t: TestContext) {
+  let empty: Slice<string> = []
+  let cases = [
+    BindCase { name: "no args", sql: "SELECT 1", args: empty, want: "SELECT 1" },
+    BindCase {
+      name: "postgres numeric",
+      sql: "SELECT * FROM users WHERE id = $1",
+      args: ["42"],
+      want: "SELECT * FROM users WHERE id = 42",
+    },
+    BindCase {
+      name: "postgres string",
+      sql: "SELECT * FROM users WHERE name = $1",
+      args: ["alice"],
+      want: "SELECT * FROM users WHERE name = 'alice'",
+    },
+    BindCase {
+      name: "postgres mixed",
+      sql: "SELECT * FROM users WHERE id = $1 AND name = $2",
+      args: ["42", "alice"],
+      want: "SELECT * FROM users WHERE id = 42 AND name = 'alice'",
+    },
+    BindCase {
+      name: "postgres 10+ args",
+      sql: "INSERT INTO t VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+      args: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"],
+      want: "INSERT INTO t VALUES (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)",
+    },
+    BindCase {
+      name: "mysql numeric",
+      sql: "SELECT * FROM users WHERE id = ?",
+      args: ["42"],
+      want: "SELECT * FROM users WHERE id = 42",
+    },
+    BindCase {
+      name: "mysql string",
+      sql: "SELECT * FROM users WHERE name = ?",
+      args: ["alice"],
+      want: "SELECT * FROM users WHERE name = 'alice'",
+    },
+    BindCase {
+      name: "mysql more placeholders than args",
+      sql: "SELECT ? AND ? AND ?",
+      args: ["1", "2"],
+      want: "SELECT 1 AND 2 AND ?",
+    },
+    BindCase {
+      name: "quote escaping",
+      sql: "SELECT * FROM users WHERE name = $1",
+      args: ["O'Brien"],
+      want: "SELECT * FROM users WHERE name = 'O''Brien'",
+    },
+    BindCase {
+      name: "boolean not quoted",
+      sql: "SELECT * FROM users WHERE active = $1",
+      args: ["true"],
+      want: "SELECT * FROM users WHERE active = true",
+    },
+    BindCase {
+      name: "null not quoted",
+      sql: "SELECT * FROM users WHERE name = $1",
+      args: ["NULL"],
+      want: "SELECT * FROM users WHERE name = NULL",
+    },
+    BindCase {
+      name: "float not quoted",
+      sql: "SELECT * FROM t WHERE price > $1",
+      args: ["3.14"],
+      want: "SELECT * FROM t WHERE price > 3.14",
+    },
+  ]
+
+  for c in cases {
+    t.run(c.name, |_| {
+      let got = bind(c.sql, c.args)
+      assert got == c.want
+    })
+  }
+}
+
+/// Edge cases beyond the Go suite.
+#[test("bind edge cases")]
+fn test_bind_edges(t: TestContext) {
+  // Reverse-order replacement: with 10 args, $1 does not clobber $10.
+  let ten = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]
+  assert bind("$1 $10", ten) == "1 10"
+  // Lowercase null stays bare, like the Go original.
+  assert bind("x = $1", ["null"]) == "x = null"
+  // false stays bare.
+  assert bind("x = $1", ["false"]) == "x = false"
+  // A single arg reused across every matching $1 occurrence.
+  assert bind("$1 = $1", ["v"]) == "'v' = 'v'"
+  // MySQL: extra args beyond placeholders are ignored.
+  assert bind("SELECT ?", ["1", "2"]) == "SELECT 1"
+  // Negative-number-looking string is parseable as float and stays bare.
+  assert bind("x = $1", ["-5"]) == "x = -5"
+  // Empty-string arg is quoted.
+  assert bind("x = $1", [""]) == "x = ''"
+}

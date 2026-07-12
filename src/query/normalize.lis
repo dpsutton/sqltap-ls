@@ -1,0 +1,148 @@
+/// SQL query normalization: replace literal values with placeholders so that
+/// structurally identical queries can be grouped together.
+
+const SPACE: byte = 32 // ' '
+const TAB: byte = 9 // '\t'
+const NEWLINE: byte = 10 // '\n'
+const CARRIAGE: byte = 13 // '\r'
+const QUOTE: byte = 39 // '\''
+const DOLLAR: byte = 36 // '$'
+const QUESTION: byte = 63 // '?'
+const DOT: byte = 46 // '.'
+const ZERO: byte = 48 // '0'
+const NINE: byte = 57 // '9'
+
+fn is_digit(c: byte) -> bool {
+  c >= ZERO && c <= NINE
+}
+
+fn is_space(c: byte) -> bool {
+  c == SPACE || c == TAB || c == NEWLINE || c == CARRIAGE
+}
+
+/// Boundary characters that terminate (or precede) a standalone numeric
+/// literal: whitespace and the SQL operator/punctuation set.
+fn is_num_boundary(c: byte) -> bool {
+  // ',' '(' ')' '=' '<' '>' '+' '-' '*' '/' ';'
+  is_space(c) ||
+    c == 44 || c == 40 || c == 41 || c == 61 || c == 60 || c == 62 ||
+    c == 43 || c == 45 || c == 42 || c == 47 || c == 59
+}
+
+/// Replaces literal values in a SQL query with placeholders.
+///
+/// String literals (`'...'`, with `''` as an escaped quote) become `'?'`,
+/// standalone numeric literals become `?`, and `$N` parameters are kept as-is.
+/// Consecutive whitespace is collapsed to a single space, and leading and
+/// trailing spaces are trimmed. An empty input yields an empty output.
+pub fn normalize(sql: string) -> string {
+  if sql == "" {
+    return ""
+  }
+
+  let bytes = sql.bytes()
+  let n = bytes.length()
+  let mut out: Slice<byte> = []
+  let mut i = 0
+  let mut prev_space = false
+
+  while i < n {
+    let ch = bytes[i]
+
+    if ch == QUOTE {
+      // String literal → '?'
+      out = out.append(QUOTE)
+      out = out.append(QUESTION)
+      out = out.append(QUOTE)
+      i = scan_string(bytes, i)
+      prev_space = false
+      continue
+    }
+
+    if ch == DOLLAR && i + 1 < n && is_digit(bytes[i + 1]) {
+      // $N parameter kept verbatim.
+      out = out.append(DOLLAR)
+      let mut j = i + 1
+      while j < n && is_digit(bytes[j]) {
+        out = out.append(bytes[j])
+        j += 1
+      }
+      i = j
+      prev_space = false
+      continue
+    }
+
+    if is_digit(ch) && (i == 0 || is_num_boundary(bytes[i - 1])) {
+      if let Some(next) = scan_number(bytes, i) {
+        out = out.append(QUESTION)
+        i = next
+        prev_space = false
+        continue
+      }
+    }
+
+    if is_space(ch) {
+      if !prev_space && out.length() > 0 {
+        out = out.append(SPACE)
+        prev_space = true
+      }
+      i += 1
+      continue
+    }
+
+    out = out.append(ch)
+    i += 1
+    prev_space = false
+  }
+
+  trim_right_space(out)
+}
+
+/// Returns the position just past the closing quote of the string literal that
+/// starts at `pos`. A doubled `''` is treated as an escaped quote, not a close.
+fn scan_string(bytes: Slice<byte>, pos: int) -> int {
+  let n = bytes.length()
+  let mut j = pos + 1
+  while j < n {
+    if bytes[j] == QUOTE && j + 1 < n && bytes[j + 1] == QUOTE {
+      j += 2
+      continue
+    }
+    if bytes[j] == QUOTE {
+      j += 1
+      break
+    }
+    j += 1
+  }
+  j
+}
+
+/// Checks whether a numeric literal starts at `pos`. Returns `Some(newPos)` if
+/// it is a standalone number (ending at a boundary or end of input), or `None`
+/// if the digits are part of a larger identifier and should be kept verbatim.
+fn scan_number(bytes: Slice<byte>, pos: int) -> Option<int> {
+  let n = bytes.length()
+  let mut j = pos + 1
+  while j < n && (is_digit(bytes[j]) || bytes[j] == DOT) {
+    j += 1
+  }
+  if j >= n || is_num_boundary(bytes[j]) {
+    Some(j)
+  } else {
+    None
+  }
+}
+
+/// Builds a string from `out`, trimming trailing ASCII spaces (matching Go's
+/// `strings.TrimRight(s, " ")`).
+fn trim_right_space(out: Slice<byte>) -> string {
+  let mut end = out.length()
+  while end > 0 && out[end - 1] == SPACE {
+    end -= 1
+  }
+  let mut trimmed: Slice<byte> = []
+  for i in 0..end {
+    trimmed = trimmed.append(out[i])
+  }
+  trimmed as string
+}
