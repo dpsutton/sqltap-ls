@@ -1,0 +1,143 @@
+import "go:sort"
+import "go:time"
+import "event"
+
+/// Which metric the analytics view is sorted by (descending). Cycles on `s`.
+#[iterate]
+pub enum AnalyticsSort {
+  Total,
+  Count,
+  Avg,
+  P95,
+}
+
+impl AnalyticsSort {
+  pub fn label(self) -> string {
+    match self {
+      AnalyticsSort.Total => "total",
+      AnalyticsSort.Count => "count",
+      AnalyticsSort.Avg => "avg",
+      AnalyticsSort.P95 => "p95",
+    }
+  }
+
+  /// The next sort mode in the cycle total -> count -> avg -> p95 -> total.
+  pub fn next(self) -> AnalyticsSort {
+    match self {
+      AnalyticsSort.Total => AnalyticsSort.Count,
+      AnalyticsSort.Count => AnalyticsSort.Avg,
+      AnalyticsSort.Avg => AnalyticsSort.P95,
+      AnalyticsSort.P95 => AnalyticsSort.Total,
+    }
+  }
+}
+
+/// One aggregated analytics row: a normalized query and its duration metrics.
+pub struct AnalyticsRow {
+  pub query: string,
+  pub count: int,
+  pub total: time.Duration,
+  pub avg: time.Duration,
+  pub p95: time.Duration,
+  pub max: time.Duration,
+}
+
+// Internal accumulator while grouping.
+struct Agg {
+  query: string,
+  count: int,
+  total: time.Duration,
+  durations: Slice<time.Duration>,
+}
+
+/// Aggregate query events by normalized query. Non-query ops and events with an
+/// empty normalized query are skipped. Groups are returned in first-seen order
+/// (insertion order), matching the Go export's `order` slice; the display sort
+/// is applied separately via `sort_analytics_rows`.
+pub fn build_analytics_rows(events: Slice<event.Event>) -> Slice<AnalyticsRow> {
+  let mut order: Slice<string> = []
+  let mut aggs: Slice<Agg> = []
+
+  for ev in events {
+    if !ev.op.is_query() {
+      continue
+    }
+    let nq = ev.normalized_query
+    if nq == "" {
+      continue
+    }
+    let dur = ev.duration
+    match index_of(order, nq) {
+      Some(i) => {
+        aggs[i] = Agg {
+          query: nq,
+          count: aggs[i].count + 1,
+          total: aggs[i].total + dur,
+          durations: aggs[i].durations.append(dur),
+        }
+      },
+      None => {
+        order = order.append(nq)
+        aggs = aggs.append(Agg { query: nq, count: 1, total: dur, durations: [dur] })
+      },
+    }
+  }
+
+  aggs.map(finalize)
+}
+
+fn finalize(g: Agg) -> AnalyticsRow {
+  let sorted = sorted_durations(g.durations)
+  AnalyticsRow {
+    query: g.query,
+    count: g.count,
+    total: g.total,
+    avg: (g.total as int64 / g.count as int64) as time.Duration,
+    p95: percentile(sorted, 0.95),
+    max: sorted[sorted.length() - 1],
+  }
+}
+
+fn index_of(xs: Slice<string>, target: string) -> Option<int> {
+  let mut i = 0
+  while i < xs.length() {
+    if xs[i] == target {
+      return Some(i)
+    }
+    i += 1
+  }
+  None
+}
+
+fn sorted_durations(ds: Slice<time.Duration>) -> Slice<time.Duration> {
+  let mut out = ds.map(|d| d as int64)
+  sort.Slice(out, |a, b| out[a] < out[b])
+  out.map(|v| v as time.Duration)
+}
+
+/// The p-quantile of a sorted duration slice (nearest-rank, floor index),
+/// matching Go's percentile: idx = int((n-1) * p). Empty input is zero.
+pub fn percentile(sorted: Slice<time.Duration>, p: float64) -> time.Duration {
+  if sorted.is_empty() {
+    return 0 as time.Duration
+  }
+  let idx = ((sorted.length() - 1) as float64 * p) as int
+  sorted[idx]
+}
+
+/// Sort analytics rows in place-equivalent (returns a new slice) by the given
+/// metric, descending.
+pub fn sort_analytics_rows(rows: Slice<AnalyticsRow>, mode: AnalyticsSort) -> Slice<AnalyticsRow> {
+  let mut out = rows.map(|r| r)
+  sort.SliceStable(out, |a, b| row_less(out[a], out[b], mode))
+  out
+}
+
+fn row_less(a: AnalyticsRow, b: AnalyticsRow, mode: AnalyticsSort) -> bool {
+  match mode {
+    AnalyticsSort.Total => a.total > b.total,
+    AnalyticsSort.Count => a.count > b.count,
+    AnalyticsSort.Avg => a.avg > b.avg,
+    AnalyticsSort.P95 => a.p95 > b.p95,
+  }
+}

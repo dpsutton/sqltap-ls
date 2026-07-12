@@ -1,0 +1,219 @@
+import "go:regexp"
+import "go:strings"
+import "go:time"
+import "event"
+
+/// Comparison direction for a duration filter token (`d>100ms` / `d<50ms`).
+pub enum DurOp {
+  Gt,
+  Lt,
+}
+
+/// One parsed filter token. Tokens are ANDed together against each event.
+/// Ported from filter.go's filterCondition (a tagged union): the payload only
+/// exists for the variant that uses it, so illegal combinations (a text value
+/// on an error condition) are unrepresentable.
+pub enum FilterCond {
+  Text { text: string },
+  Duration { op: DurOp, value: time.Duration },
+  Error,
+  Op { pattern: string },
+  NPlus1,
+  Slow,
+}
+
+fn duration_re() -> Ref<regexp.Regexp> {
+  regexp.MustCompile(r"^d([><])(\d+(?:\.\d+)?)(us|µs|ms|s|m)$")
+}
+
+/// Protocol op names accepted by `op:...` filters.
+fn protocol_op(pattern: string) -> Option<event.Op> {
+  match pattern {
+    "query" => Some(event.Op.Query),
+    "exec" => Some(event.Op.Exec),
+    "prepare" => Some(event.Op.Prepare),
+    "bind" => Some(event.Op.Bind),
+    "execute" => Some(event.Op.Execute),
+    "begin" => Some(event.Op.Begin),
+    "commit" => Some(event.Op.Commit),
+    "rollback" => Some(event.Op.Rollback),
+    _ => None,
+  }
+}
+
+/// True when `pattern` is a SQL keyword prefix (select/insert/update/delete)
+/// matched against the query text rather than the protocol op.
+fn is_sql_keyword(pattern: string) -> bool {
+  pattern == "select" || pattern == "insert" || pattern == "update" || pattern == "delete"
+}
+
+/// Parse a filter input string into a list of conditions (ANDed). Whitespace-
+/// separated tokens; each token is a duration, a keyword, an op:, or plain text.
+pub fn parse_filter(input: string) -> Slice<FilterCond> {
+  let tokens = strings.Fields(input)
+  let mut conds: Slice<FilterCond> = []
+  for tok in tokens {
+    if let Some(c) = parse_duration(tok) {
+      conds = conds.append(c)
+    } else {
+      let lower = strings.ToLower(tok)
+      if lower == "error" {
+        conds = conds.append(FilterCond.Error)
+      } else if lower == "n+1" || lower == "nplus1" {
+        conds = conds.append(FilterCond.NPlus1)
+      } else if lower == "slow" {
+        conds = conds.append(FilterCond.Slow)
+      } else if let Some(c) = parse_op(lower) {
+        conds = conds.append(c)
+      } else {
+        conds = conds.append(FilterCond.Text { text: lower })
+      }
+    }
+  }
+  conds
+}
+
+fn parse_duration(tok: string) -> Option<FilterCond> {
+  let re = duration_re()
+  let m = re.FindStringSubmatch(tok)
+  if m.length() < 4 {
+    return None
+  }
+  let op = if m[1] == "<" { DurOp.Lt } else { DurOp.Gt }
+  let raw = m[2] + unit_suffix(m[3])
+  match time.ParseDuration(raw) {
+    Ok(d) => Some(FilterCond.Duration { op, value: d }),
+    Err(_) => None,
+  }
+}
+
+fn unit_suffix(unit: string) -> string {
+  match unit {
+    "us" => "us",
+    "µs" => "us",
+    "ms" => "ms",
+    "s" => "s",
+    "m" => "m",
+    _ => "ms",
+  }
+}
+
+fn parse_op(lower: string) -> Option<FilterCond> {
+  if !strings.HasPrefix(lower, "op:") {
+    return None
+  }
+  let pattern = strings.TrimPrefix(lower, "op:")
+  if pattern == "" {
+    return None
+  }
+  Some(FilterCond.Op { pattern })
+}
+
+/// True when `ev` satisfies condition `c`.
+pub fn matches_event(c: FilterCond, ev: event.Event) -> bool {
+  match c {
+    FilterCond.Text { text } => strings.Contains(strings.ToLower(ev.query), text),
+    FilterCond.Duration { op, value } => match op {
+      DurOp.Gt => ev.duration > value,
+      DurOp.Lt => ev.duration < value,
+    },
+    FilterCond.Error => ev.outcome.is_failed(),
+    FilterCond.NPlus1 => ev.nplus1,
+    FilterCond.Slow => ev.slow,
+    FilterCond.Op { pattern } => match_op(ev, pattern),
+  }
+}
+
+fn match_op(ev: event.Event, pattern: string) -> bool {
+  if let Some(op) = protocol_op(pattern) {
+    return op_eq(ev.op, op)
+  }
+  if is_sql_keyword(pattern) {
+    let q = strings.TrimSpace(strings.ToLower(ev.query))
+    return strings.HasPrefix(q, pattern)
+  }
+  false
+}
+
+fn op_eq(a: event.Op, b: event.Op) -> bool {
+  op_index(a) == op_index(b)
+}
+
+fn op_index(op: event.Op) -> int {
+  match op {
+    event.Op.Query => 0,
+    event.Op.Exec => 1,
+    event.Op.Prepare => 2,
+    event.Op.Bind => 3,
+    event.Op.Execute => 4,
+    event.Op.Begin => 5,
+    event.Op.Commit => 6,
+    event.Op.Rollback => 7,
+  }
+}
+
+/// True when `ev` satisfies every condition (an empty list matches everything).
+pub fn match_all_conditions(ev: event.Event, conds: Slice<FilterCond>) -> bool {
+  for c in conds {
+    if !matches_event(c, ev) {
+      return false
+    }
+  }
+  true
+}
+
+/// Human-readable description of a filter input, for the footer. Mirrors Go's
+/// describeFilter: text conditions become "text:<t>", everything else prints
+/// its token form. An unparseable/empty input returns the input verbatim.
+pub fn describe_filter(input: string) -> string {
+  let conds = parse_filter(input)
+  if conds.is_empty() {
+    return input
+  }
+  let parts = conds.map(describe_cond)
+  strings.Join(parts, " ")
+}
+
+fn describe_cond(c: FilterCond) -> string {
+  match c {
+    FilterCond.Text { text } => f"text:{text}",
+    FilterCond.Duration { op, value } => {
+      let sym = match op {
+        DurOp.Gt => ">",
+        DurOp.Lt => "<",
+      }
+      f"d{sym}{value.String()}"
+    },
+    FilterCond.Error => "error",
+    FilterCond.NPlus1 => "n+1",
+    FilterCond.Slow => "slow",
+    FilterCond.Op { pattern } => f"op:{pattern}",
+  }
+}
+
+/// Arrange footer `items` into lines that fit within `width`. Each line begins
+/// with two spaces; items are separated by two spaces. A non-positive width
+/// falls back to a single line. Ported from wrapFooterItems.
+pub fn wrap_footer_items(items: Slice<string>, width: int) -> string {
+  let prefix = "  "
+  let sep = "  "
+  if width <= 0 {
+    return prefix + strings.Join(items, sep)
+  }
+  let mut lines: Slice<string> = []
+  let mut line = prefix
+  for item in items {
+    if line == prefix {
+      line += item
+    } else if line.length() + sep.length() + item.length() <= width {
+      line += sep + item
+    } else {
+      lines = lines.append(line)
+      line = prefix + item
+    }
+  }
+  if line != prefix {
+    lines = lines.append(line)
+  }
+  strings.Join(lines, "\n")
+}

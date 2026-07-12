@@ -1,0 +1,228 @@
+import "go:time"
+import "event"
+
+// --- fixtures ------------------------------------------------------------
+
+fn fev(op: event.Op, query: string, dur: time.Duration, err_msg: string) -> event.Event {
+  let outcome = if err_msg != "" {
+    event.Outcome.Failed { message: err_msg }
+  } else {
+    event.Outcome.Ok { rows_affected: 0 }
+  }
+  event.Event {
+    id: "",
+    op,
+    query,
+    args: [],
+    start_time: time.Date(2026, time.July, 12, 0, 0, 0, 0, time.UTC),
+    duration: dur,
+    outcome,
+    tx_id: None,
+    nplus1: false,
+    slow: false,
+    normalized_query: query,
+  }
+}
+
+// --- parse_filter (port of TestParseFilter) ------------------------------
+
+#[test("tui: parse_filter empty yields no conditions")]
+fn test_parse_empty() {
+  assert parse_filter("").is_empty()
+}
+
+#[test("tui: parse_filter plain text")]
+fn test_parse_text() {
+  let c = parse_filter("users")
+  assert c.length() == 1
+  let assert FilterCond.Text { text: "users" } = c[0]
+}
+
+#[test("tui: parse_filter duration greater-than ms")]
+fn test_parse_dur_gt_ms() {
+  let c = parse_filter("d>100ms")
+  assert c.length() == 1
+  let assert FilterCond.Duration { op: DurOp.Gt, value } = c[0]
+  assert value == 100 * time.Millisecond
+}
+
+#[test("tui: parse_filter duration less-than us")]
+fn test_parse_dur_lt_us() {
+  let c = parse_filter("d<500us")
+  let assert FilterCond.Duration { op: DurOp.Lt, value } = c[0]
+  assert value == 500 * time.Microsecond
+}
+
+#[test("tui: parse_filter duration greater-than s")]
+fn test_parse_dur_gt_s() {
+  let c = parse_filter("d>1s")
+  let assert FilterCond.Duration { op: DurOp.Gt, value } = c[0]
+  assert value == 1 * time.Second
+}
+
+#[test("tui: parse_filter error keyword")]
+fn test_parse_error() {
+  let assert FilterCond.Error = parse_filter("error")[0]
+}
+
+#[test("tui: parse_filter error keyword case-insensitive")]
+fn test_parse_error_ci() {
+  let assert FilterCond.Error = parse_filter("Error")[0]
+}
+
+#[test("tui: parse_filter op:select")]
+fn test_parse_op_select() {
+  let assert FilterCond.Op { pattern: "select" } = parse_filter("op:select")[0]
+}
+
+#[test("tui: parse_filter op:begin")]
+fn test_parse_op_begin() {
+  let assert FilterCond.Op { pattern: "begin" } = parse_filter("op:begin")[0]
+}
+
+#[test("tui: parse_filter n+1 and nplus1 keywords")]
+fn test_parse_nplus1() {
+  let assert FilterCond.NPlus1 = parse_filter("n+1")[0]
+  let assert FilterCond.NPlus1 = parse_filter("nplus1")[0]
+}
+
+#[test("tui: parse_filter slow keyword")]
+fn test_parse_slow() {
+  let assert FilterCond.Slow = parse_filter("slow")[0]
+}
+
+#[test("tui: parse_filter combined op and duration")]
+fn test_parse_combined() {
+  let c = parse_filter("op:select d>100ms")
+  assert c.length() == 2
+  let assert FilterCond.Op { pattern: "select" } = c[0]
+  let assert FilterCond.Duration { op: DurOp.Gt, .. } = c[1]
+}
+
+#[test("tui: parse_filter unknown tokens fall back to text")]
+fn test_parse_text_words() {
+  let c = parse_filter("WHERE id")
+  assert c.length() == 2
+  let assert FilterCond.Text { text: "where" } = c[0]
+  let assert FilterCond.Text { text: "id" } = c[1]
+}
+
+// --- matches_event (port of TestMatchesEvent) ----------------------------
+
+#[test("tui: matches_event text match / no-match")]
+fn test_match_text() {
+  let ev = fev(event.Op.Query, "SELECT id FROM users", 10 * time.Millisecond, "")
+  assert matches_event(FilterCond.Text { text: "users" }, ev)
+  assert !matches_event(FilterCond.Text { text: "orders" }, ev)
+}
+
+#[test("tui: matches_event duration GT")]
+fn test_match_dur_gt() {
+  let ev = fev(event.Op.Query, "SELECT 1", 100 * time.Millisecond, "")
+  assert matches_event(FilterCond.Duration { op: DurOp.Gt, value: 50 * time.Millisecond }, ev)
+  assert !matches_event(FilterCond.Duration { op: DurOp.Gt, value: 200 * time.Millisecond }, ev)
+}
+
+#[test("tui: matches_event duration LT")]
+fn test_match_dur_lt() {
+  let ev = fev(event.Op.Query, "SELECT 1", 100 * time.Millisecond, "")
+  assert matches_event(FilterCond.Duration { op: DurOp.Lt, value: 200 * time.Millisecond }, ev)
+  assert !matches_event(FilterCond.Duration { op: DurOp.Lt, value: 50 * time.Millisecond }, ev)
+}
+
+#[test("tui: matches_event error")]
+fn test_match_error() {
+  assert matches_event(FilterCond.Error, fev(event.Op.Query, "SELECT 1", 10 * time.Millisecond, "some error"))
+  assert !matches_event(FilterCond.Error, fev(event.Op.Query, "SELECT 1", 10 * time.Millisecond, ""))
+}
+
+#[test("tui: matches_event op:select on query text prefix")]
+fn test_match_op_select() {
+  let sel = fev(event.Op.Query, "SELECT id FROM users", 10 * time.Millisecond, "")
+  let ins = fev(event.Op.Query, "INSERT INTO users VALUES (1)", 10 * time.Millisecond, "")
+  assert matches_event(FilterCond.Op { pattern: "select" }, sel)
+  assert !matches_event(FilterCond.Op { pattern: "select" }, ins)
+}
+
+#[test("tui: matches_event op:begin on protocol op")]
+fn test_match_op_begin() {
+  assert matches_event(FilterCond.Op { pattern: "begin" }, fev(event.Op.Begin, "", 0 as time.Duration, ""))
+  assert !matches_event(FilterCond.Op { pattern: "begin" }, fev(event.Op.Commit, "", 0 as time.Duration, ""))
+}
+
+#[test("tui: matches_event op:insert on query text prefix")]
+fn test_match_op_insert() {
+  let ev = fev(event.Op.Query, "INSERT INTO users (name) VALUES ('alice')", 5 * time.Millisecond, "")
+  assert matches_event(FilterCond.Op { pattern: "insert" }, ev)
+}
+
+#[test("tui: matches_event n+1 flag")]
+fn test_match_nplus1() {
+  let base = fev(event.Op.Query, "SELECT id FROM users WHERE id = 1", 5 * time.Millisecond, "")
+  let flagged = event.Event { nplus1: true, ..base }
+  assert matches_event(FilterCond.NPlus1, flagged)
+  assert !matches_event(FilterCond.NPlus1, base)
+}
+
+#[test("tui: matches_event slow flag")]
+fn test_match_slow() {
+  let base = fev(event.Op.Query, "SELECT id FROM users", 500 * time.Millisecond, "")
+  let flagged = event.Event { slow: true, ..base }
+  assert matches_event(FilterCond.Slow, flagged)
+  assert !matches_event(FilterCond.Slow, base)
+}
+
+// --- match_all_conditions (port of TestMatchAllConditions) ----------------
+
+#[test("tui: match_all_conditions ANDs tokens")]
+fn test_match_all() {
+  let ev = fev(event.Op.Query, "SELECT id FROM users WHERE id = 1", 150 * time.Millisecond, "")
+  let empty: Slice<FilterCond> = []
+  assert match_all_conditions(ev, empty)
+  assert match_all_conditions(ev, [
+    FilterCond.Op { pattern: "select" },
+    FilterCond.Duration { op: DurOp.Gt, value: 100 * time.Millisecond },
+  ])
+  assert !match_all_conditions(ev, [
+    FilterCond.Op { pattern: "select" },
+    FilterCond.Duration { op: DurOp.Gt, value: 200 * time.Millisecond },
+  ])
+  assert match_all_conditions(ev, [
+    FilterCond.Op { pattern: "select" },
+    FilterCond.Text { text: "users" },
+  ])
+}
+
+// --- describe_filter (port of TestDescribeFilter) ------------------------
+
+#[test("tui: describe_filter renders tokens")]
+fn test_describe() {
+  assert describe_filter("op:select d>100ms") == "op:select d>100ms"
+  assert describe_filter("error") == "error"
+  assert describe_filter("n+1") == "n+1"
+  assert describe_filter("slow") == "slow"
+  assert describe_filter("users") == "text:users"
+}
+
+// --- wrap_footer_items (port of TestWrapFooterItems) ---------------------
+
+#[test("tui: wrap_footer_items all fit one line")]
+fn test_wrap_one_line() {
+  assert wrap_footer_items(["a: foo", "b: bar"], 80) == "  a: foo  b: bar"
+}
+
+#[test("tui: wrap_footer_items wraps to two lines")]
+fn test_wrap_two_lines() {
+  assert wrap_footer_items(["a: foo", "b: bar", "c: baz"], 20) == "  a: foo  b: bar\n  c: baz"
+}
+
+#[test("tui: wrap_footer_items each on own line")]
+fn test_wrap_each_line() {
+  let got = wrap_footer_items(["long-item-1", "long-item-2", "long-item-3"], 18)
+  assert got == "  long-item-1\n  long-item-2\n  long-item-3"
+}
+
+#[test("tui: wrap_footer_items zero width single line")]
+fn test_wrap_zero_width() {
+  assert wrap_footer_items(["a", "b"], 0) == "  a  b"
+}

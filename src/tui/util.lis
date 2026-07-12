@@ -1,10 +1,34 @@
 // Shared helpers and ANSI codes for the tui module. All files in src/tui share
 // one module scope, so these live in one place.
 
+import "go:strings"
+import "query"
+
 // ANSI styling used by the renderer. (The highlight module keeps its own
 // copies private, so the tui declares the two it needs for chrome.)
 const SGR_BOLD = "\x1b[1m"
 const SGR_RESET = "\x1b[0m"
+const SGR_FAINT = "\x1b[2m"
+
+fn to_lower(s: string) -> string {
+  strings.ToLower(s)
+}
+
+fn contains_lower(haystack: string, needle_lower: string) -> bool {
+  strings.Contains(strings.ToLower(haystack), needle_lower)
+}
+
+fn query_bind(sql: string, args: Slice<string>) -> string {
+  query.bind(sql, args)
+}
+
+// A handful of ANSI colors used for chrome (tx coloring, timeline bars, alert).
+// 38;5;N is the 256-color SGR foreground; the tui palette matches the Go
+// lipgloss.Color("N") values (6,3,5,2,4,1 for tx cycling; 1/3/5/4 for bars).
+fn sgr_fg(n: string) -> string {
+  let esc = esc_rune()
+  f"{esc as string}[38;5;{n}m"
+}
 
 fn max_int(a: int, b: int) -> int {
   if a > b { a } else { b }
@@ -12,4 +36,38 @@ fn max_int(a: int, b: int) -> int {
 
 fn min_int(a: int, b: int) -> int {
   if a < b { a } else { b }
+}
+
+/// Slice `s` to visible columns `[lo, hi)`, preserving ANSI escapes (which have
+/// zero visible width) and appending a reset if any style was emitted. This is
+/// the ANSI-aware horizontal cut the explain/analytics views use in place of
+/// Go's ansi.Cut — visible columns before `lo` are dropped, columns at or past
+/// `hi` are cut.
+pub fn ansi_cut(s: string, lo: int, hi: int) -> string {
+  let esc = esc_rune()
+  let mut out = ""
+  let mut col = 0
+  let mut in_escape = false
+  let mut saw_escape = false
+  for r in s.runes() {
+    if in_escape {
+      out += r as string
+      if r == 'm' {
+        in_escape = false
+      }
+    } else if r == esc {
+      in_escape = true
+      saw_escape = true
+      out += r as string
+    } else {
+      if col >= lo && col < hi {
+        out += r as string
+      }
+      col += 1
+    }
+  }
+  if saw_escape {
+    out += SGR_RESET
+  }
+  out
 }
