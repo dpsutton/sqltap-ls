@@ -1,0 +1,182 @@
+import "event"
+import "go:time"
+
+/// Build a minimal event carrying just an id (and optional query) for tests.
+fn make_event(id: string, query: string) -> event.Event {
+  event.Event {
+    id,
+    op: event.Op.Query,
+    query,
+    args: [],
+    start_time: time.Now(),
+    duration: 0 as time.Duration,
+    outcome: event.Outcome.Ok { rows_affected: 0 },
+    ..
+  }
+}
+
+#[test("subscribe receives a published event")]
+fn test_publish_subscribe() {
+  let b = Broker.new(8)
+  let sub = b.subscribe()
+
+  b.publish(make_event("1", "SELECT 1"))
+
+  let assert Some(got) = sub.events.receive()
+  assert got.id == "1"
+  assert got.query == "SELECT 1"
+
+  b.unsubscribe(sub.id)
+  b.close()
+}
+
+#[test("every subscriber receives each published event")]
+fn test_multiple_subscribers() {
+  let b = Broker.new(8)
+  let s1 = b.subscribe()
+  let s2 = b.subscribe()
+
+  assert b.subscriber_count() == 2
+
+  b.publish(make_event("1", ""))
+
+  let assert Some(g1) = s1.events.receive()
+  assert g1.id == "1"
+  let assert Some(g2) = s2.events.receive()
+  assert g2.id == "1"
+
+  b.close()
+}
+
+#[test("unsubscribe stops delivery and is idempotent")]
+fn test_unsubscribe_idempotent() {
+  let b = Broker.new(8)
+  let sub = b.subscribe()
+
+  assert b.subscriber_count() == 1
+
+  b.unsubscribe(sub.id)
+  assert b.subscriber_count() == 0
+
+  // Idempotent: a second unsubscribe (and an unknown id) is a no-op.
+  b.unsubscribe(sub.id)
+  b.unsubscribe(9999)
+  assert b.subscriber_count() == 0
+
+  // The subscriber channel was closed by unsubscribe.
+  let assert None = sub.events.receive()
+
+  b.close()
+}
+
+#[test("unsubscribed subscriber receives no further events")]
+fn test_unsubscribe_stops_delivery() {
+  let b = Broker.new(8)
+  let sub = b.subscribe()
+
+  b.unsubscribe(sub.id)
+  // Round-trip so the unsubscribe is fully processed before we publish.
+  assert b.subscriber_count() == 0
+
+  b.publish(make_event("1", ""))
+  // Force the publish through the actor.
+  assert b.subscriber_count() == 0
+
+  // Channel is closed and was never sent the event: receive yields None.
+  let assert None = sub.events.receive()
+
+  b.close()
+}
+
+#[test("a full subscriber drops events without blocking publish")]
+fn test_slow_subscriber_drops() {
+  let b = Broker.new(1)
+  let sub = b.subscribe()
+
+  // Fill the single-slot buffer, then publish again — the second event has
+  // nowhere to go and must be dropped rather than block the publisher.
+  b.publish(make_event("1", ""))
+  b.publish(make_event("2", ""))
+  // Round-trip: guarantees both publishes were processed by the actor.
+  assert b.subscriber_count() == 1
+
+  let assert Some(first) = sub.events.receive()
+  assert first.id == "1"
+
+  // No second event buffered — the drop happened.
+  let empty = select {
+    let Some(_) = sub.events.receive() => false,
+    _ => true,
+  }
+  assert empty
+
+  b.close()
+}
+
+#[test("subscriber_count tracks subscribe and unsubscribe")]
+fn test_subscriber_count() {
+  let b = Broker.new(4)
+  assert b.subscriber_count() == 0
+
+  let s1 = b.subscribe()
+  let s2 = b.subscribe()
+  let s3 = b.subscribe()
+  assert b.subscriber_count() == 3
+
+  b.unsubscribe(s2.id)
+  assert b.subscriber_count() == 2
+
+  b.unsubscribe(s1.id)
+  b.unsubscribe(s3.id)
+  assert b.subscriber_count() == 0
+
+  b.close()
+}
+
+#[test("concurrent publishes all reach a subscriber")]
+fn test_concurrent_publish() {
+  let b = Broker.new(256)
+  let sub = b.subscribe()
+
+  let n = 100
+  let done = Channel.buffered<()>(n)
+  for _ in 0..n {
+    task {
+      b.publish(make_event("x", ""))
+      done.send(())
+    }
+  }
+  // Wait for every publisher task to finish enqueuing its command.
+  for _ in 0..n {
+    let _ = done.receive()
+  }
+  // Round-trip flushes all publish commands through the actor.
+  assert b.subscriber_count() == 1
+
+  let mut count = 0
+  loop {
+    let more = select {
+      let Some(_) = sub.events.receive() => true,
+      _ => false,
+    }
+    if !more {
+      break
+    }
+    count += 1
+  }
+  assert count == n
+
+  b.close()
+}
+
+#[test("close stops the actor and closes subscriber channels")]
+fn test_close() {
+  let b = Broker.new(8)
+  let sub = b.subscribe()
+  assert b.subscriber_count() == 1
+
+  b.close()
+
+  // Remaining subscriber channel was closed by the actor on Stop.
+  let assert None = sub.events.receive()
+}
