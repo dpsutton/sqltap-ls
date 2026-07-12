@@ -1,0 +1,80 @@
+import "go:regexp"
+import "go:strings"
+import "go:time"
+
+import "detect"
+import "event"
+import "query"
+
+/// Matches the SQL FROM keyword as a whole word, used to detect whether a
+/// SELECT references any table. A simple keyword check: FROM inside
+/// expressions (e.g. EXTRACT(EPOCH FROM NOW())) is misclassified as a table
+/// reference, which is a safe default — such queries stay in N+1 detection
+/// rather than being silently dropped.
+fn from_clause_re() -> Ref<regexp.Regexp> {
+  regexp.MustCompile(r"(?i)\bFROM\b")
+}
+
+/// True when `q` is a system/metadata SELECT that should be excluded from
+/// N+1 detection: a SELECT with no FROM clause, such as SELECT database(),
+/// SELECT @@version, or SELECT 1.
+fn is_metadata_query(q: string) -> bool {
+  !from_clause_re().MatchString(q)
+}
+
+/// True when the event is an application-level SELECT worth monitoring for
+/// N+1 patterns.
+pub fn is_select_query(op: event.Op, q: string) -> bool {
+  if !op.is_query() {
+    return false
+  }
+  let trimmed = strings.TrimSpace(q)
+  if !strings.HasPrefix(strings.ToUpper(trimmed), "SELECT") {
+    return false
+  }
+  !is_metadata_query(trimmed)
+}
+
+/// Enriches raw proxy events with the derived signals the clients consume:
+/// normalized query text, N+1 flags, and slow-query flags. Owned by the
+/// daemon's single pump task; the detector is mutated without locking.
+pub struct Enricher {
+  detector: Option<Ref<detect.Detector>>,
+  slow_threshold: time.Duration,
+}
+
+/// An enriched event plus the N+1 alert to surface, when this event first
+/// crossed the detection threshold (respecting the alert cooldown).
+pub struct Enriched {
+  pub ev: event.Event,
+  pub alert: Option<detect.Alert>,
+}
+
+impl Enricher {
+  /// `detector` None disables N+1 detection; `slow_threshold` 0 disables
+  /// slow-query flagging.
+  pub fn new(detector: Option<Ref<detect.Detector>>, slow_threshold: time.Duration) -> Enricher {
+    Enricher { detector, slow_threshold }
+  }
+
+  pub fn enrich(self: Ref<Enricher>, mut ev: event.Event) -> Enriched {
+    if ev.query != "" {
+      ev.normalized_query = query.normalize(ev.query)
+    }
+
+    let mut alert: Option<detect.Alert> = None
+    if let Some(det) = self.detector {
+      if is_select_query(ev.op, ev.query) {
+        let result = det.record(ev.query, ev.start_time)
+        ev.nplus1 = result.matched
+        alert = result.alert
+      }
+    }
+
+    if (self.slow_threshold as int64) > 0 && ev.duration >= self.slow_threshold {
+      ev.slow = true
+    }
+
+    Enriched { ev, alert }
+  }
+}

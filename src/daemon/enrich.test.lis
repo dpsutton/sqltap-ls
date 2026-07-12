@@ -1,0 +1,99 @@
+import "go:time"
+
+import "detect"
+import "event"
+
+fn ev(op: event.Op, q: string, dur: time.Duration) -> event.Event {
+  event.Event {
+    id: "1",
+    op,
+    query: q,
+    args: [],
+    start_time: time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC),
+    duration: dur,
+    outcome: event.Outcome.Ok { rows_affected: 0 },
+    tx_id: None,
+    nplus1: false,
+    slow: false,
+    normalized_query: "",
+  }
+}
+
+#[test("daemon: is_select_query classifies application selects")]
+fn test_is_select_query(t: TestContext) {
+  let cases = [
+    ("regular select", event.Op.Query, "SELECT id FROM users WHERE id = 1", true),
+    ("metadata: SELECT database()", event.Op.Query, "SELECT database()", false),
+    ("metadata: SELECT @@version", event.Op.Query, "SELECT @@version", false),
+    ("metadata: SELECT 1", event.Op.Query, "SELECT 1", false),
+    ("metadata: SELECT NOW()", event.Op.Query, "SELECT NOW()", false),
+    ("metadata: SELECT current_database()", event.Op.Query, "SELECT current_database()", false),
+    ("select with FROM (not metadata)", event.Op.Query, "SELECT 1 FROM dual", true),
+    ("insert not select", event.Op.Query, "INSERT INTO users VALUES (1)", false),
+    ("begin op", event.Op.Begin, "", false),
+    ("lowercase select", event.Op.Execute, "select id from users", true),
+  ]
+  for (name, op, q, want) in cases {
+    t.run(name, |_| {
+      assert is_select_query(op, q) == want
+    })
+  }
+}
+
+#[test("daemon: is_metadata_query detects missing FROM clause")]
+fn test_is_metadata_query(t: TestContext) {
+  let cases = [
+    ("no FROM clause", "SELECT database()", true),
+    ("system variable", "SELECT @@session.transaction_read_only", true),
+    ("constant", "SELECT 1", true),
+    ("has FROM clause", "SELECT id FROM users", false),
+    ("subquery with FROM", "SELECT (SELECT COUNT(*) FROM orders)", false),
+    // False negative by design: FROM in an expression, no table.
+    ("expression-level FROM (Postgres EXTRACT)", "SELECT EXTRACT(EPOCH FROM NOW())", false),
+  ]
+  for (name, q, want) in cases {
+    t.run(name, |_| {
+      assert is_metadata_query(q) == want
+    })
+  }
+}
+
+#[test("daemon: enrich normalizes, flags slow and n+1")]
+fn test_enrich() {
+  let mut detector = detect.Detector.new(2, time.Second, 10 * time.Second)
+  let mut enricher = Enricher.new(Some(&detector), 100 * time.Millisecond)
+
+  // Slow + normalization.
+  let slow = enricher.enrich(ev(event.Op.Query, "SELECT * FROM users WHERE id = 42", 150 * time.Millisecond))
+  assert slow.ev.slow
+  assert slow.ev.normalized_query == "SELECT * FROM users WHERE id = ?"
+  assert slow.alert == None
+  assert !slow.ev.nplus1
+
+  // Second occurrence of the same select within the window crosses the
+  // threshold: flagged and alerted.
+  let again = enricher.enrich(ev(event.Op.Query, "SELECT * FROM users WHERE id = 42", time.Millisecond))
+  assert again.ev.nplus1
+  assert !again.ev.slow
+  let assert Some(alert) = again.alert
+  assert alert.count == 2
+
+  // Third: still matched, but alert suppressed by cooldown.
+  let third = enricher.enrich(ev(event.Op.Query, "SELECT * FROM users WHERE id = 42", time.Millisecond))
+  assert third.ev.nplus1
+  assert third.alert == None
+}
+
+#[test("daemon: enrich with detection and slow flagging disabled")]
+fn test_enrich_disabled() {
+  let mut enricher = Enricher.new(None, 0 as time.Duration)
+  let out = enricher.enrich(ev(event.Op.Query, "SELECT * FROM users WHERE id = 1", time.Hour))
+  assert !out.ev.slow
+  assert !out.ev.nplus1
+  assert out.alert == None
+  assert out.ev.normalized_query == "SELECT * FROM users WHERE id = ?"
+
+  // Empty query: nothing to normalize.
+  let empty = enricher.enrich(ev(event.Op.Begin, "", 0 as time.Duration))
+  assert empty.ev.normalized_query == ""
+}
