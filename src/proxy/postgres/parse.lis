@@ -1,0 +1,325 @@
+import "go:encoding/binary"
+import "go:strconv"
+import "go:strings"
+import "go:time"
+
+/// Timestamp type OIDs in the PostgreSQL type catalog.
+pub const OID_TIMESTAMP: uint32 = 1114
+
+/// timestamptz OID in the PostgreSQL type catalog.
+pub const OID_TIMESTAMP_TZ: uint32 = 1184
+
+/// Unix timestamp of PostgreSQL's internal epoch (2000-01-01 00:00:00 UTC).
+const PG_EPOCH_UNIX: int64 = 946684800
+
+/// A cursor over a message payload, reading protocol fields left to right.
+/// Every accessor is bounds-checked and returns `None` past the end so a
+/// malformed frame degrades to a partial capture rather than a panic.
+struct Cursor { buf: Slice<byte>, pos: int }
+
+impl Cursor {
+  fn new(buf: Slice<byte>) -> Cursor {
+    Cursor { buf, pos: 0 }
+  }
+
+  fn remaining(self) -> int {
+    self.buf.length() - self.pos
+  }
+
+  /// Read a NUL-terminated string; advances past the terminator.
+  fn cstring(self: Ref<Cursor>) -> Option<string> {
+    let start = self.pos
+    let mut i = self.pos
+    while i < self.buf.length() {
+      if self.buf[i] == 0 {
+        let s = bytes_to_string(self.buf[start..i])
+        self.pos = i + 1
+        return Some(s)
+      }
+      i += 1
+    }
+    None
+  }
+
+  /// Read a single byte.
+  fn byte(self: Ref<Cursor>) -> Option<byte> {
+    if self.pos >= self.buf.length() { return None }
+    let b = self.buf[self.pos]
+    self.pos += 1
+    Some(b)
+  }
+
+  /// Read a big-endian int16.
+  fn int16(self: Ref<Cursor>) -> Option<int16> {
+    if self.remaining() < 2 { return None }
+    let v = binary.BigEndian.Uint16(self.buf[self.pos..self.pos + 2])
+    self.pos += 2
+    Some(v as int16)
+  }
+
+  /// Read a big-endian int32.
+  fn int32(self: Ref<Cursor>) -> Option<int32> {
+    if self.remaining() < 4 { return None }
+    let v = binary.BigEndian.Uint32(self.buf[self.pos..self.pos + 4])
+    self.pos += 4
+    Some(v as int32)
+  }
+
+  /// Read a big-endian uint32.
+  fn uint32(self: Ref<Cursor>) -> Option<uint32> {
+    if self.remaining() < 4 { return None }
+    let v = binary.BigEndian.Uint32(self.buf[self.pos..self.pos + 4])
+    self.pos += 4
+    Some(v)
+  }
+
+  /// Read exactly `n` bytes.
+  fn take(self: Ref<Cursor>, n: int) -> Option<Slice<byte>> {
+    if n < 0 || self.remaining() < n { return None }
+    let out = self.buf[self.pos..self.pos + n]
+    self.pos += n
+    Some(out)
+  }
+}
+
+/// Convert raw bytes to a string without any decoding (Go's `string([]byte)`).
+fn bytes_to_string(b: Slice<byte>) -> string {
+  b as string
+}
+
+/// Narrow an ASCII `rune` (character) literal to a `byte`. Lisette rejects a
+/// direct `'Z' as byte` cast (rune is wider than byte), so protocol type-byte
+/// literals go through this one-int-hop helper.
+fn ascii(r: rune) -> byte {
+  let n = r as int
+  n as byte
+}
+
+/// A parsed 'P' Parse message.
+pub struct ParseMsg {
+  pub name: string,
+  pub query: string,
+  pub param_oids: Slice<uint32>,
+}
+
+/// Parse the payload of a 'P' Parse message (type byte already stripped).
+pub fn parse_parse(payload: Slice<byte>) -> Option<ParseMsg> {
+  let mut cur = Cursor.new(payload)
+  let name = cur.cstring()?
+  let query = cur.cstring()?
+  let n = cur.int16()?
+  let mut oids: Slice<uint32> = []
+  let mut i: int16 = 0
+  while i < n {
+    let oid = cur.uint32()?
+    oids = oids.append(oid)
+    i += 1
+  }
+  Some(ParseMsg { name, query, param_oids: oids })
+}
+
+/// A parsed 'D' Describe message.
+pub struct DescribeMsg {
+  pub object_type: byte,
+  pub name: string,
+}
+
+/// Parse the payload of a 'D' Describe message.
+pub fn parse_describe(payload: Slice<byte>) -> Option<DescribeMsg> {
+  let mut cur = Cursor.new(payload)
+  let object_type = cur.byte()?
+  let name = cur.cstring()?
+  Some(DescribeMsg { object_type, name })
+}
+
+/// A parsed 'B' Bind message: the pieces needed to reconstruct arg strings.
+pub struct BindMsg {
+  pub stmt_name: string,
+  pub format_codes: Slice<int16>,
+  pub params: Slice<BindParam>,
+}
+
+/// One bound parameter: its raw bytes, or NULL.
+pub enum BindParam {
+  Null,
+  Value(Slice<byte>),
+}
+
+/// Parse the payload of a 'B' Bind message.
+pub fn parse_bind(payload: Slice<byte>) -> Option<BindMsg> {
+  let mut cur = Cursor.new(payload)
+  let _portal = cur.cstring()?
+  let stmt_name = cur.cstring()?
+
+  let nfmt = cur.int16()?
+  let mut format_codes: Slice<int16> = []
+  let mut i: int16 = 0
+  while i < nfmt {
+    let code = cur.int16()?
+    format_codes = format_codes.append(code)
+    i += 1
+  }
+
+  let nparams = cur.int16()?
+  let mut params: Slice<BindParam> = []
+  let mut j: int16 = 0
+  while j < nparams {
+    let len = cur.int32()?
+    if len < 0 {
+      params = params.append(BindParam.Null)
+    } else {
+      let raw = cur.take(len as int)?
+      params = params.append(BindParam.Value(raw))
+    }
+    j += 1
+  }
+
+  Some(BindMsg { stmt_name, format_codes, params })
+}
+
+/// True if the i-th parameter uses binary format. Per the protocol, a single
+/// format code applies to all parameters; zero codes means text for all.
+pub fn is_binary_format(codes: Slice<int16>, i: int) -> bool {
+  if codes.length() == 0 {
+    false
+  } else if codes.length() == 1 {
+    codes[0] == 1
+  } else {
+    i < codes.length() && codes[i] == 1
+  }
+}
+
+/// Render one bound parameter as a readable arg string, mirroring the Go proxy:
+/// text-format params become their raw bytes as a string, binary params are
+/// decoded by OID/length, and NULLs (Go's nil Parameters entry) become "".
+pub fn render_param(p: BindParam, binary_format: bool, oid: uint32) -> string {
+  match p {
+    BindParam.Null => "",
+    BindParam.Value(raw) => {
+      if binary_format {
+        decode_binary_param(raw, oid)
+      } else {
+        bytes_to_string(raw)
+      }
+    },
+  }
+}
+
+/// Decode a binary-format parameter into a readable string. Timestamp OIDs with
+/// 8 bytes decode as RFC3339Nano; otherwise byte length picks a common type.
+pub fn decode_binary_param(p: Slice<byte>, oid: uint32) -> string {
+  if (oid == OID_TIMESTAMP || oid == OID_TIMESTAMP_TZ) && p.length() == 8 {
+    let micros = binary.BigEndian.Uint64(p) as int64
+    return decode_pg_timestamp_micros(micros)
+  }
+  match p.length() {
+    1 => {
+      let v = p[0] as int8
+      strconv.Itoa(v as int)
+    },
+    2 => {
+      let v = binary.BigEndian.Uint16(p) as int16
+      strconv.Itoa(v as int)
+    },
+    4 => {
+      let v = binary.BigEndian.Uint32(p) as int32
+      strconv.FormatInt(v as int64, 10)
+    },
+    8 => {
+      let v = binary.BigEndian.Uint64(p) as int64
+      strconv.FormatInt(v, 10)
+    },
+    16 => format_uuid(p),
+    _ => bytes_to_string(p),
+  }
+}
+
+/// Convert a PostgreSQL binary timestamp (microseconds since 2000-01-01 UTC)
+/// to an RFC3339Nano string that PostgreSQL can parse back.
+pub fn decode_pg_timestamp_micros(microsecs: int64) -> string {
+  let mut sec = microsecs / 1000000
+  let mut usec = microsecs % 1000000
+  if usec < 0 {
+    sec -= 1
+    usec += 1000000
+  }
+  let t = time.Unix(sec + PG_EPOCH_UNIX, usec * 1000)
+  t.UTC().Format(time.RFC3339Nano)
+}
+
+const HEX_DIGITS: string = "0123456789abcdef"
+
+/// Format 16 bytes as a canonical lowercase UUID (8-4-4-4-12). Hand-rolled to
+/// avoid a third-party uuid dependency.
+fn format_uuid(p: Slice<byte>) -> string {
+  let mut sb = strings.Builder {}
+  for i in 0..16 {
+    if i == 4 || i == 6 || i == 8 || i == 10 {
+      let _ = sb.WriteByte(ascii('-'))
+    }
+    let b = p[i]
+    let hi = (b >> 4) as int
+    let lo = (b & 0x0f) as int
+    let _ = sb.WriteByte(HEX_DIGITS.byte_at(hi))
+    let _ = sb.WriteByte(HEX_DIGITS.byte_at(lo))
+  }
+  sb.String()
+}
+
+/// Extract the row count from a CommandComplete tag: the last space-separated
+/// token parsed as int64, or 0 on parse failure. e.g. "INSERT 0 5" -> 5.
+pub fn parse_rows_affected(tag: string) -> int64 {
+  let parts = strings.Split(tag, " ")
+  if parts.length() == 0 { return 0 }
+  let last = parts[parts.length() - 1]
+  match strconv.ParseInt(last, 10, 64) {
+    Ok(n) => n,
+    Err(_) => 0,
+  }
+}
+
+/// Extract the human-readable message ('M' field) from an ErrorResponse
+/// payload. Fields are (1-byte type + cstring) pairs terminated by a 0 byte.
+pub fn parse_error_message(payload: Slice<byte>) -> string {
+  let mut cur = Cursor.new(payload)
+  loop {
+    let ft = match cur.byte() {
+      Some(b) => b,
+      None => return "",
+    }
+    if ft == 0 { return "" }
+    let value = match cur.cstring() {
+      Some(s) => s,
+      None => return "",
+    }
+    if ft == ascii('M') { return value }
+  }
+}
+
+/// Parse a 't' ParameterDescription payload: int16 count then that many OIDs.
+pub fn parse_parameter_description(payload: Slice<byte>) -> Slice<uint32> {
+  let mut cur = Cursor.new(payload)
+  let n = match cur.int16() {
+    Some(v) => v,
+    None => return [],
+  }
+  let mut oids: Slice<uint32> = []
+  let mut i: int16 = 0
+  while i < n {
+    match cur.uint32() {
+      Some(oid) => {
+        oids = oids.append(oid)
+      },
+      None => return oids,
+    }
+    i += 1
+  }
+  oids
+}
+
+/// The query string carried by a 'Q' simple-query message is the payload up to
+/// (not including) its trailing NUL.
+pub fn parse_simple_query(payload: Slice<byte>) -> string {
+  let mut cur = Cursor.new(payload)
+  cur.cstring().unwrap_or(bytes_to_string(payload))
+}
