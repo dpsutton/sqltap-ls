@@ -1,0 +1,82 @@
+import "go:io"
+import "go:os"
+import "go:time"
+
+import "config"
+
+fn parse(t: TestContext, args: Slice<string>) -> ServeCommand {
+  parse_serve(args, io.Discard)
+}
+
+#[test("daemon: serve flags require driver, listen, upstream")]
+fn test_flags_required(t: TestContext) {
+  let assert ServeCommand.Invalid { message } = parse(t, [])
+  assert message.contains("required")
+}
+
+#[test("daemon: serve flags full happy path")]
+fn test_flags_happy(t: TestContext) {
+  let cmd = parse(t, [
+    "-driver=postgres",
+    "-listen=:5433",
+    "-upstream=localhost:5432",
+    "-api=:9099",
+    "-http=:8080",
+    "-nplus1-threshold=7",
+    "-nplus1-window=2s",
+    "-slow-threshold=250ms",
+  ])
+  let assert ServeCommand.Run(cfg) = cmd
+  let assert Some(driver) = cfg.driver
+  assert driver == config.Driver.Postgres
+  assert cfg.listen == ":5433"
+  assert cfg.upstream == "localhost:5432"
+  assert cfg.api_addr == ":9099"
+  assert cfg.http == ":8080"
+  assert cfg.nplus1.threshold == 7
+  assert cfg.nplus1.window == 2 * time.Second
+  assert cfg.nplus1.cooldown == 10 * time.Second
+  assert cfg.slow_threshold == 250 * time.Millisecond
+}
+
+#[test("daemon: defaults survive when flags not passed")]
+fn test_flags_defaults(t: TestContext) {
+  let cmd = parse(t, ["-driver=mysql", "-listen=:3307", "-upstream=localhost:3306"])
+  let assert ServeCommand.Run(cfg) = cmd
+  assert cfg.api_addr == ":9091"
+  assert cfg.dsn_env == "DATABASE_URL"
+  assert cfg.slow_threshold == 100 * time.Millisecond
+  assert cfg.nplus1.threshold == 5
+}
+
+#[test("daemon: grpc flag is an alias for api")]
+fn test_flags_grpc_alias(t: TestContext) {
+  let cmd = parse(t, ["-driver=tidb", "-listen=:4001", "-upstream=localhost:4000", "-grpc=:7777"])
+  let assert ServeCommand.Run(cfg) = cmd
+  assert cfg.api_addr == ":7777"
+}
+
+#[test("daemon: version flag short-circuits")]
+fn test_flags_version(t: TestContext) {
+  let assert ServeCommand.ShowVersion = parse(t, ["-version"])
+}
+
+#[test("daemon: invalid driver rejected")]
+fn test_flags_bad_driver(t: TestContext) {
+  let assert ServeCommand.Invalid { .. } = parse(t, ["-driver=oracle", "-listen=:1", "-upstream=:2"])
+}
+
+#[test("daemon: cli flags override config file")]
+fn test_flags_override_file(t: TestContext) -> Result<(), error> {
+  let dir = os.MkdirTemp("", "sqltap-flags")?
+  defer os.RemoveAll(dir)
+  let path = dir + "/cfg.yaml"
+  os.WriteFile(path, "driver: postgres\nlisten: \":5433\"\nupstream: \"db:5432\"\nslow_threshold: 50ms\n" as Slice<byte>, 0o600 as os.FileMode)?
+
+  let cmd = parse(t, [f"-config={path}", "-slow-threshold=1s", "-listen=:6000"])
+  let assert ServeCommand.Run(cfg) = cmd
+  assert cfg.slow_threshold == time.Second
+  assert cfg.listen == ":6000"
+  assert cfg.upstream == "db:5432"
+  Ok(())
+}

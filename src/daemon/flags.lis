@@ -1,0 +1,105 @@
+import "go:flag"
+import "go:fmt"
+import "go:io"
+import "go:time"
+
+import "config"
+
+/// Everything `sqltap serve` needs after flag parsing: the resolved config
+/// plus meta requests that short-circuit startup.
+pub enum ServeCommand {
+  Run(config.Config),
+  ShowVersion,
+  Invalid { message: string },
+}
+
+/// Parse `sqltap serve` flags over `args` (not including the subcommand),
+/// load the config file, and apply CLI overrides. Only flags explicitly
+/// passed override file values, mirroring the Go daemon.
+pub fn parse_serve(args: Slice<string>, output: io.Writer) -> ServeCommand {
+  let mut fs = flag.NewFlagSet("sqltap serve", flag.ContinueOnError)
+  fs.SetOutput(output)
+
+  let config_path = fs.String("config", "", "path to config file (default: .sql-tap.yaml)")
+  let driver = fs.String("driver", "", "database driver: postgres, mysql, tidb (required)")
+  let listen = fs.String("listen", "", "client listen address (required)")
+  let upstream = fs.String("upstream", "", "upstream database address (required)")
+  let api = fs.String("api", "", "HTTP API address for TUI/CI clients (default: :9091)")
+  let grpc = fs.String("grpc", "", "deprecated alias for -api")
+  let dsn_env = fs.String("dsn-env", "DATABASE_URL", "environment variable holding DSN for EXPLAIN")
+  let http = fs.String("http", "", "HTTP address for the web UI (e.g. :8080)")
+  let nplus1_threshold = fs.Int("nplus1-threshold", 5, "N+1 detection threshold (0 to disable)")
+  let nplus1_window = fs.Duration("nplus1-window", time.Second, "N+1 detection time window")
+  let nplus1_cooldown = fs.Duration("nplus1-cooldown", 10 * time.Second, "N+1 alert cooldown per query template")
+  let slow_threshold = fs.Duration("slow-threshold", 100 * time.Millisecond, "slow query threshold (0 to disable)")
+  let show_version = fs.Bool("version", false, "show version and exit")
+
+  if let Err(e) = fs.Parse(args) {
+    return ServeCommand.Invalid { message: f"{e}" }
+  }
+  if show_version.* {
+    return ServeCommand.ShowVersion
+  }
+
+  let mut cfg = match config.load(config_path.*) {
+    Ok(c) => c,
+    Err(e) => {
+      return ServeCommand.Invalid { message: f"{e}" }
+    },
+  }
+
+  // Only explicitly-passed flags override the config file.
+  let mut set = Map.new<string, bool>()
+  fs.Visit(|f| {
+    set[f.Name] = true
+  })
+
+  if set.get("driver").unwrap_or(false) && driver.* != "" {
+    match config.Driver.parse(driver.*) {
+      Ok(d) => {
+        cfg.driver = Some(d)
+      },
+      Err(e) => {
+        return ServeCommand.Invalid { message: f"{e}" }
+      },
+    }
+  }
+  if set.get("listen").unwrap_or(false) && listen.* != "" {
+    cfg.listen = listen.*
+  }
+  if set.get("upstream").unwrap_or(false) && upstream.* != "" {
+    cfg.upstream = upstream.*
+  }
+  if set.get("api").unwrap_or(false) && api.* != "" {
+    cfg.api_addr = api.*
+  }
+  if set.get("grpc").unwrap_or(false) && grpc.* != "" {
+    cfg.api_addr = grpc.*
+  }
+  if set.get("dsn-env").unwrap_or(false) && dsn_env.* != "" {
+    cfg.dsn_env = dsn_env.*
+  }
+  if set.get("http").unwrap_or(false) {
+    cfg.http = http.*
+  }
+  if set.get("nplus1-threshold").unwrap_or(false) {
+    cfg.nplus1.threshold = nplus1_threshold.*
+  }
+  if set.get("nplus1-window").unwrap_or(false) {
+    cfg.nplus1.window = nplus1_window.*
+  }
+  if set.get("nplus1-cooldown").unwrap_or(false) {
+    cfg.nplus1.cooldown = nplus1_cooldown.*
+  }
+  if set.get("slow-threshold").unwrap_or(false) {
+    cfg.slow_threshold = slow_threshold.*
+  }
+
+  if cfg.driver == None || cfg.listen == "" || cfg.upstream == "" {
+    fmt.Fprintf(output, "sqltap serve — SQL proxy daemon\n\nUsage:\n  sqltap serve [flags]\n\nFlags:\n")
+    fs.PrintDefaults()
+    return ServeCommand.Invalid { message: "driver, listen, and upstream are required" }
+  }
+
+  ServeCommand.Run(cfg)
+}
