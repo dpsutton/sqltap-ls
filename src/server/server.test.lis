@@ -1,0 +1,167 @@
+import "go:bufio"
+import "go:context"
+import "go:encoding/json"
+import "go:errors"
+import "go:net"
+import "go:net/http"
+import "go:strings"
+import "go:time"
+
+import "broker"
+import "event"
+import "explain"
+
+/// Minimal decode target for an SSE `data:` frame — the fields the SSE test
+/// asserts on. Avoids WireEvent's enum `op` field, which has no JSON zero.
+#[json]
+struct SseEvent {
+  id: string,
+  op: string,
+  query: string,
+  duration_ms: float64,
+}
+
+/// A running server under test: its base URL and a handle to shut it down.
+struct Harness {
+  base_url: string,
+  server: Server,
+  lis: net.Listener,
+}
+
+impl Harness {
+  fn stop(self) {
+    // Bounded shutdown: a lingering SSE connection must not hang the test.
+    let (ctx, cancel) = context.WithTimeout(context.Background(), 2 as time.Duration * time.Second)
+    defer cancel()
+    let _ = self.server.shutdown(ctx)
+    let _ = self.lis.Close()
+  }
+}
+
+/// Start a Server on a fresh loopback listener and serve it in a task.
+fn start(b: Ref<broker.Broker>, ex: Option<explain.Client>) -> Result<Harness, error> {
+  let lis = net.Listen("tcp", "127.0.0.1:0")?
+  let server = Server.new(b, ex)
+  let listener = lis
+  task {
+    let _ = server.serve(listener)
+  }
+  let addr = match lis.Addr() {
+    Some(a) => a.String(),
+    None => return Err(errors.New("listener has no address")),
+  }
+  Ok(Harness { base_url: f"http://{addr}", server, lis })
+}
+
+#[test("static index is served as text/html")]
+fn test_static_index() -> Result<(), error> {
+  let b = &broker.Broker.new(8)
+  let h = start(b, None)?
+  defer h.stop()
+
+  let resp = http.Get(f"{h.base_url}/")?
+  defer { let _ = resp.Body }
+  assert resp.StatusCode == http.StatusOK
+  let ct = resp.Header.Get("Content-Type")
+  assert strings.Contains(ct, "text/html")
+  Ok(())
+}
+
+#[test("explain returns 503 when unconfigured")]
+fn test_explain_unconfigured() -> Result<(), error> {
+  let b = &broker.Broker.new(8)
+  let h = start(b, None)?
+  defer h.stop()
+
+  let body = strings.NewReader("{\"query\":\"SELECT 1\",\"args\":[],\"analyze\":false}")
+  let resp = http.Post(f"{h.base_url}/api/explain", "application/json", body)?
+  assert resp.StatusCode == http.StatusServiceUnavailable
+
+  let Some(rc) = resp.Body else {
+    return Err(errors.New("no response body"))
+  }
+  let mut result = ExplainResponse { .. }
+  json.NewDecoder(rc).Decode(&result)?
+  assert strings.Contains(result.error, "not configured")
+  Ok(())
+}
+
+#[test("explain returns 400 on a bad body")]
+fn test_explain_bad_body() -> Result<(), error> {
+  let b = &broker.Broker.new(8)
+  let h = start(b, None)?
+  defer h.stop()
+
+  let body = strings.NewReader("not json at all")
+  let resp = http.Post(f"{h.base_url}/api/explain", "application/json", body)?
+  assert resp.StatusCode == http.StatusServiceUnavailable
+  Ok(())
+}
+
+#[test("SSE stream delivers a published event")]
+fn test_sse_receives_event() -> Result<(), error> {
+  let b = &broker.Broker.new(8)
+  let h = start(b, None)?
+  defer h.stop()
+
+  let resp = http.Get(f"{h.base_url}/api/events")?
+  assert resp.Header.Get("Content-Type") == "text/event-stream"
+
+  // The stream is open (headers flushed) once Get returns, but the broker
+  // subscription registers slightly later; wait for it deterministically.
+  wait_for_subscriber(b)
+
+  b.publish(event.Event {
+    id: "test-1",
+    op: event.Op.Query,
+    query: "SELECT 1",
+    start_time: time.Date(2026, time.February, 20, 15, 4, 5, 0, time.UTC),
+    duration: 5 as time.Duration * time.Millisecond,
+    outcome: event.Outcome.Ok { rows_affected: 0 },
+    ..
+  })
+
+  let Some(body) = resp.Body else {
+    return Err(errors.New("no response body"))
+  }
+  // Close the stream once we have our frame so shutdown doesn't block on it.
+  defer { let _ = body.Close() }
+  let reader = bufio.NewReader(body)
+  let data = read_sse_data(reader)?
+
+  let mut wire = SseEvent { .. }
+  json.Unmarshal(data as Slice<byte>, &wire)?
+  assert wire.id == "test-1"
+  assert wire.op == "Query"
+  assert wire.query == "SELECT 1"
+  assert wire.duration_ms > 4.9
+  assert wire.duration_ms < 5.1
+  Ok(())
+}
+
+/// Block until the broker reports at least one subscriber, so a published event
+/// is guaranteed to reach the SSE handler. Bounded so a bug can't hang the test.
+fn wait_for_subscriber(b: Ref<broker.Broker>) {
+  for _ in 0..200 {
+    if b.subscriber_count() > 0 {
+      return
+    }
+    time.Sleep(5 as time.Duration * time.Millisecond)
+  }
+}
+
+/// Read SSE frames until the first `data: ` line and return its payload.
+fn read_sse_data(reader: Ref<bufio.Reader>) -> Result<string, error> {
+  let newline: byte = 10
+  loop {
+    let line = match reader.ReadString(newline) {
+      Partial.Ok(s) => s,
+      Partial.Both(s, _) => s,
+      Partial.Err(e) => return Err(e).wrap_err("read sse"),
+    }
+    let trimmed = strings.TrimRight(line, "\n")
+    if strings.HasPrefix(trimmed, "data: ") {
+      return Ok(strings.TrimPrefix(trimmed, "data: "))
+    }
+  }
+}
