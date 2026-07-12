@@ -1,0 +1,64 @@
+import "go:regexp"
+import "go:strconv"
+import "go:time"
+
+/// Matches PostgreSQL-style timestamp cast placeholders such as
+/// $1::TIMESTAMP, $2::TIMESTAMPTZ, $3::TIMESTAMP WITH TIME ZONE, etc.
+/// The prefix "TIMESTAMP" covers all variants.
+fn timestamp_cast_re() -> Ref<regexp.Regexp> {
+  regexp.MustCompile(r"(?i)\$(\d+)\s*::\s*TIMESTAMP")
+}
+
+/// Unix timestamp of PostgreSQL's internal epoch (2000-01-01 00:00:00 UTC).
+const PG_EPOCH_UNIX: int64 = 946684800
+
+/// Convert captured string args to query args for QueryContext. Args whose
+/// placeholder is cast to a timestamp type in the query are re-interpreted
+/// from the PostgreSQL binary encoding (int64 microseconds since 2000-01-01
+/// UTC) into time.Time, preventing "date/time field value out of range"
+/// errors when re-running captured binary parameters.
+fn build_any_args(query: string, args: Slice<string>) -> Slice<Unknown> {
+  let ts_params = parse_timestamp_params(query)
+  let mut any_args: Slice<Unknown> = []
+  for (i, a) in args.enumerate() {
+    let is_ts = ts_params.get(i + 1).unwrap_or(false)
+    if is_ts {
+      match parse_pg_timestamp(a) {
+        Some(t) => {
+          any_args = any_args.append(t)
+          continue
+        },
+        None => (),
+      }
+    }
+    any_args = any_args.append(a)
+  }
+  any_args
+}
+
+/// The set of 1-indexed parameter numbers cast to a timestamp type in `query`.
+fn parse_timestamp_params(query: string) -> Map<int, bool> {
+  let mut params = Map.new<int, bool>()
+  for m in timestamp_cast_re().FindAllStringSubmatch(query, -1) {
+    if let Ok(n) = strconv.Atoi(m[1]) {
+      params[n] = true
+    }
+  }
+  params
+}
+
+/// Interpret `s` as a PostgreSQL binary-encoded timestamp: int64 microseconds
+/// since 2000-01-01 00:00:00 UTC.
+fn parse_pg_timestamp(s: string) -> Option<time.Time> {
+  let Ok(microsecs) = strconv.ParseInt(s, 10, 64) else {
+    return None
+  }
+  let mut sec = microsecs / 1_000_000
+  let mut usec = microsecs % 1_000_000
+  // For negative microsecs, usec is negative; carry into sec.
+  if usec < 0 {
+    sec -= 1
+    usec += 1_000_000
+  }
+  Some(time.Unix(sec + PG_EPOCH_UNIX, usec * 1_000).UTC())
+}

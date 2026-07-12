@@ -1,0 +1,100 @@
+import "go:time"
+
+#[test("parse_timestamp_params finds timestamp casts")]
+fn test_parse_timestamp_params(t: TestContext) {
+  let cases = [
+    ("no casts", "SELECT * FROM users WHERE id = $1", Map.new<int, bool>()),
+    ("timestamp with time zone", "SELECT * FROM t WHERE created_at > $1::TIMESTAMP WITH TIME ZONE", Map.from([(1, true)])),
+    ("timestamptz", "SELECT * FROM t WHERE ts = $2::TIMESTAMPTZ", Map.from([(2, true)])),
+    ("timestamp without time zone", "SELECT * FROM t WHERE ts = $3::TIMESTAMP WITHOUT TIME ZONE", Map.from([(3, true)])),
+    ("plain timestamp", "SELECT * FROM t WHERE ts = $1::TIMESTAMP", Map.from([(1, true)])),
+    ("lowercase cast", "SELECT * FROM t WHERE ts > $1::timestamp with time zone", Map.from([(1, true)])),
+    ("spaces around ::", "SELECT * FROM t WHERE ts = $1 :: TIMESTAMP", Map.from([(1, true)])),
+    ("mixed casts", "SELECT * FROM t WHERE key = $1::VARCHAR AND ts > $2::TIMESTAMP WITH TIME ZONE", Map.from([(2, true)])),
+    ("multiple timestamp params", "SELECT * FROM t WHERE a > $1::TIMESTAMP AND b < $3::TIMESTAMPTZ", Map.from([(1, true), (3, true)])),
+  ]
+  for (name, query, want) in cases {
+    t.run(name, |_| {
+      let got = parse_timestamp_params(query)
+      assert got.equals(want)
+    })
+  }
+}
+
+#[test("parse_pg_timestamp decodes binary-encoded microseconds")]
+fn test_parse_pg_timestamp(t: TestContext) {
+  t.run("postgres epoch (zero)", |_| {
+    let assert Some(ts) = parse_pg_timestamp("0")
+    assert ts.Equal(time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC))
+  })
+  t.run("large microseconds (~2026)", |_| {
+    let assert Some(ts) = parse_pg_timestamp("825505830505628")
+    let want = time.Unix((825505830 as int64) + PG_EPOCH_UNIX, 505628 * 1_000 as int64).UTC()
+    assert ts.Equal(want)
+  })
+  t.run("negative whole second", |_| {
+    let assert Some(ts) = parse_pg_timestamp("-1000000")
+    assert ts.Equal(time.Date(1999, time.December, 31, 23, 59, 59, 0, time.UTC))
+  })
+  t.run("negative fractional carries into seconds", |_| {
+    let assert Some(ts) = parse_pg_timestamp("-1")
+    assert ts.Equal(time.Date(1999, time.December, 31, 23, 59, 59, 999999000, time.UTC))
+  })
+  t.run("non-integer string", |_| {
+    assert parse_pg_timestamp("2026-02-27T14:10:30Z") == None
+  })
+  t.run("float string", |_| {
+    assert parse_pg_timestamp("1.5") == None
+  })
+  t.run("empty string", |_| {
+    assert parse_pg_timestamp("") == None
+  })
+}
+
+#[test("build_any_args converts only timestamp-cast args")]
+fn test_build_any_args(t: TestContext) {
+  t.run("no args", |_| {
+    assert build_any_args("SELECT 1", []).is_empty()
+  })
+  t.run("non-timestamp arg stays a string", |_| {
+    let got = build_any_args("SELECT * FROM users WHERE id = $1", ["42"])
+    assert got.length() == 1
+    let assert Some(s) = assert_type<string>(got[0])
+    assert s == "42"
+  })
+  t.run("timestamp arg becomes time.Time", |_| {
+    let got = build_any_args(
+      "SELECT * FROM t WHERE expired_at > $1::TIMESTAMP WITH TIME ZONE",
+      ["825505830505628"],
+    )
+    let assert Some(ts) = assert_type<time.Time>(got[0])
+    assert ts.After(time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC))
+  })
+  t.run("non-integer timestamp arg stays a string", |_| {
+    let got = build_any_args(
+      "SELECT * FROM t WHERE ts > $1::TIMESTAMP WITH TIME ZONE",
+      ["2026-02-27T14:10:30Z"],
+    )
+    let assert Some(s) = assert_type<string>(got[0])
+    assert s == "2026-02-27T14:10:30Z"
+  })
+  t.run("mixed varchar and timestamp", |_| {
+    let got = build_any_args(
+      "SELECT * FROM t WHERE key = $1::VARCHAR AND ts > $2::TIMESTAMP WITH TIME ZONE",
+      ["019c5c4f-f25a-772b-97d4-1646a125080d", "825505830505628"],
+    )
+    let assert Some(s) = assert_type<string>(got[0])
+    assert s == "019c5c4f-f25a-772b-97d4-1646a125080d"
+    let assert Some(_) = assert_type<time.Time>(got[1])
+  })
+}
+
+#[test("explain prefixes per dialect")]
+fn test_prefix() {
+  assert prefix(Mode.Plan, Dialect.Mysql) == "EXPLAIN FORMAT=TREE "
+  assert prefix(Mode.Analyze, Dialect.Mysql) == "EXPLAIN ANALYZE "
+  assert prefix(Mode.Plan, Dialect.Postgres) == "EXPLAIN "
+  assert prefix(Mode.Analyze, Dialect.Tidb) == "EXPLAIN ANALYZE "
+  assert Mode.Plan.label() == "EXPLAIN"
+  assert Mode.Analyze.label() == "EXPLAIN ANALYZE"
+}

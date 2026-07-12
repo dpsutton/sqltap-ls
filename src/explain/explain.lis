@@ -1,0 +1,122 @@
+import "go:context"
+import "go:database/sql"
+import "go:strings"
+import "go:time"
+
+// Blank imports register the database/sql drivers ("pgx", "mysql").
+import _ "go:github.com/jackc/pgx/v5/stdlib"
+import _ "go:github.com/go-sql-driver/mysql"
+
+/// EXPLAIN (plan only) vs EXPLAIN ANALYZE (plan + actual execution).
+pub enum Mode {
+  Plan,
+  Analyze,
+}
+
+impl Mode {
+  /// Human-readable command name, as shown in UI titles.
+  pub fn label(self) -> string {
+    match self {
+      Mode.Plan => "EXPLAIN",
+      Mode.Analyze => "EXPLAIN ANALYZE",
+    }
+  }
+}
+
+/// SQL dialect differences for EXPLAIN syntax.
+pub enum Dialect {
+  Postgres,
+  Mysql,
+  Tidb,
+}
+
+fn prefix(mode: Mode, dialect: Dialect) -> string {
+  match dialect {
+    Dialect.Mysql => match mode {
+      Mode.Plan => "EXPLAIN FORMAT=TREE ",
+      Mode.Analyze => "EXPLAIN ANALYZE ",
+    },
+    Dialect.Postgres | Dialect.Tidb => match mode {
+      Mode.Plan => "EXPLAIN ",
+      Mode.Analyze => "EXPLAIN ANALYZE ",
+    },
+  }
+}
+
+/// The output of an EXPLAIN run.
+pub struct Output {
+  pub plan: string,
+  pub duration: time.Duration,
+}
+
+/// Wraps a database connection for running EXPLAIN queries.
+pub struct Client {
+  db: Ref<sql.DB>,
+  dialect: Dialect,
+}
+
+impl Client {
+  pub fn new(db: Ref<sql.DB>, dialect: Dialect) -> Client {
+    Client { db, dialect }
+  }
+
+  /// Execute EXPLAIN / EXPLAIN ANALYZE for `query` with optional captured args.
+  pub fn run(
+    self,
+    ctx: context.Context,
+    mode: Mode,
+    query: string,
+    args: Slice<string>,
+  ) -> Result<Output, error> {
+    let any_args = build_any_args(query, args)
+
+    // MySQL/TiDB cannot parse a bare ? placeholder without args; substitute
+    // NULL for a plan-only EXPLAIN.
+    let mut q = query
+    let needs_null_subst = match self.dialect {
+      Dialect.Mysql | Dialect.Tidb => any_args.is_empty(),
+      Dialect.Postgres => false,
+    }
+    if needs_null_subst {
+      q = strings.ReplaceAll(q, "?", "NULL")
+    }
+
+    let start = time.Now()
+    let mut rows = self.db
+      .QueryContext(ctx, prefix(mode, self.dialect) + q, any_args...)
+      .wrap_err("explain: query")?
+    defer rows.Close()
+
+    let cols = rows.Columns().wrap_err("explain: columns")?
+
+    let mut lines: Slice<string> = []
+    if cols.length() > 1 {
+      lines = lines.append(cols.join("\t"))
+    }
+    while rows.Next() {
+      let mut vals: Slice<sql.NullString> = []
+      for _ in 0..cols.length() {
+        vals = vals.append(sql.NullString { .. })
+      }
+      let mut ptrs: Slice<Unknown> = []
+      for i in 0..cols.length() {
+        ptrs = ptrs.append(&vals[i])
+      }
+      rows.Scan(ptrs...).wrap_err("explain: scan")?
+      lines = lines.append(vals.map(|v| v.String).join("\t"))
+    }
+    if let Some(err) = rows.Err() {
+      return Err(err).wrap_err("explain: rows")
+    }
+
+    Ok(Output {
+      plan: lines.join("\n"),
+      duration: time.Since(start),
+    })
+  }
+
+  /// Close the underlying database connection.
+  pub fn close(self) -> Result<(), error> {
+    self.db.Close().wrap_err("explain: close")
+  }
+}
