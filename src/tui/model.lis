@@ -1,0 +1,312 @@
+import "event"
+
+/// Which screen is showing. List is the live traffic view; Inspect is the
+/// full-detail drill-down for one event. The full TUI will add Explain,
+/// Analytics, and Timeline variants here — the enum is the extension point.
+pub enum Screen {
+  List,
+  Inspect,
+}
+
+/// One visible line in the list. A plain event, or a transaction summary that
+/// (when expanded) is followed by its member events. Indices point into
+/// `Model.events` so a row never owns event data.
+pub enum Row {
+  Event { idx: int },
+  TxSummary { tx_id: string, members: Slice<int> },
+}
+
+impl Row {
+  pub fn is_summary(self) -> bool {
+    match self { Row.TxSummary { .. } => true, Row.Event { .. } => false }
+  }
+}
+
+/// The complete UI state. Pure data: every field either always exists with the
+/// same meaning (identity) or is a small mode flag — nothing here is IO. The
+/// list of collapsed tx ids and the paused buffer are the only "hidden" state;
+/// both are plain and testable.
+pub struct Model {
+  pub events: Slice<event.Event>,
+  pub cursor: int,
+  pub follow: bool,
+  pub paused: bool,
+  pub collapsed: Slice<string>,
+  pub buffered: Slice<event.Event>,
+  pub screen: Screen,
+  pub rows: Slice<Row>,
+}
+
+/// A message driving one `update` step. Events arrive from the traffic
+/// receiver, keys from the input decoder; both are values, so the whole state
+/// machine is exercisable without a terminal.
+pub enum Msg {
+  Incoming(event.Event),
+  Press(Key),
+}
+
+impl Model {
+  /// A fresh List model, following the tail, unpaused.
+  pub fn new() -> Model {
+    Model {
+      events: [],
+      cursor: 0,
+      follow: true,
+      paused: false,
+      collapsed: [],
+      buffered: [],
+      screen: Screen.List,
+      rows: [],
+    }
+  }
+
+  fn is_collapsed(self, tx_id: string) -> bool {
+    self.collapsed.contains(tx_id)
+  }
+
+  /// The event under the cursor, if the cursor is on an event row (not a tx
+  /// summary and not out of range).
+  pub fn cursor_event(self) -> Option<event.Event> {
+    if self.cursor < 0 || self.cursor >= self.rows.length() {
+      return None
+    }
+    match self.rows[self.cursor] {
+      Row.Event { idx } => Some(self.events[idx]),
+      Row.TxSummary { .. } => None,
+    }
+  }
+
+  /// The tx id associated with the cursor row (summary row, or an event that
+  /// belongs to a transaction), if any.
+  fn cursor_tx_id(self) -> Option<string> {
+    if self.cursor < 0 || self.cursor >= self.rows.length() {
+      return None
+    }
+    match self.rows[self.cursor] {
+      Row.TxSummary { tx_id, .. } => Some(tx_id),
+      Row.Event { idx } => self.events[idx].tx_id,
+    }
+  }
+}
+
+/// The pure transition function: fold a message into a new model. All list
+/// navigation, follow-mode, pause buffering, and tx collapse logic lives here
+/// and nowhere else, so unit tests drive it directly.
+pub fn update(model: Model, msg: Msg) -> Model {
+  match msg {
+    Msg.Incoming(ev) => on_event(model, ev),
+    Msg.Press(key) => on_key(model, key),
+  }
+}
+
+fn on_event(model: Model, ev: event.Event) -> Model {
+  if model.paused {
+    // Hold new traffic aside; it lands when the user unpauses.
+    return Model { buffered: model.buffered.append(ev), ..model }
+  }
+  let events = model.events.append(ev)
+  let rebuilt = rebuild(Model { events, ..model })
+  stick_to_tail(rebuilt)
+}
+
+fn on_key(model: Model, key: Key) -> Model {
+  match model.screen {
+    Screen.Inspect => on_key_inspect(model, key),
+    Screen.List => on_key_list(model, key),
+  }
+}
+
+fn on_key_inspect(model: Model, key: Key) -> Model {
+  match key {
+    Key.Char('q') | Key.Esc => Model { screen: Screen.List, ..model },
+    _ => model,
+  }
+}
+
+fn on_key_list(model: Model, key: Key) -> Model {
+  match key {
+    Key.Char('j') | Key.Down => nav_down(model),
+    Key.Char('k') | Key.Up => nav_up(model),
+    Key.PgDown | Key.CtrlD => page(model, true),
+    Key.PgUp | Key.CtrlU => page(model, false),
+    Key.Char('g') => go_top(model),
+    Key.Char('G') => go_bottom(model),
+    Key.Space => toggle_tx(model),
+    Key.Enter => enter_inspect(model),
+    Key.Char('p') => toggle_pause(model),
+    Key.CtrlL => clear(model),
+    _ => model,
+  }
+}
+
+fn last_index(model: Model) -> int {
+  max_int(model.rows.length() - 1, 0)
+}
+
+fn nav_down(model: Model) -> Model {
+  if model.rows.is_empty() {
+    return model
+  }
+  let last = last_index(model)
+  let cursor = min_int(model.cursor + 1, last)
+  // Reaching the bottom re-engages follow-mode.
+  let follow = cursor == last
+  Model { cursor, follow, ..model }
+}
+
+fn nav_up(model: Model) -> Model {
+  if model.cursor <= 0 {
+    return model
+  }
+  // Scrolling up always disengages follow.
+  Model { cursor: model.cursor - 1, follow: false, ..model }
+}
+
+fn page(model: Model, down: bool) -> Model {
+  if model.rows.is_empty() {
+    return model
+  }
+  let last = last_index(model)
+  let step = 10
+  if down {
+    let cursor = min_int(model.cursor + step, last)
+    let follow = cursor == last
+    Model { cursor, follow, ..model }
+  } else {
+    let cursor = max_int(model.cursor - step, 0)
+    Model { cursor, follow: false, ..model }
+  }
+}
+
+fn go_top(model: Model) -> Model {
+  Model { cursor: 0, follow: false, ..model }
+}
+
+fn go_bottom(model: Model) -> Model {
+  Model { cursor: last_index(model), follow: true, ..model }
+}
+
+fn enter_inspect(model: Model) -> Model {
+  if model.rows.is_empty() {
+    return model
+  }
+  match model.cursor_event() {
+    Some(_) => Model { screen: Screen.Inspect, ..model },
+    None => model, // summary rows have no detail view yet
+  }
+}
+
+fn toggle_pause(model: Model) -> Model {
+  if model.paused {
+    // Unpause: flush buffered traffic in order, then stick to the tail.
+    let events = model.events.append(model.buffered...)
+    let rebuilt = rebuild(Model { events, buffered: [], paused: false, ..model })
+    stick_to_tail(rebuilt)
+  } else {
+    Model { paused: true, ..model }
+  }
+}
+
+fn clear(model: Model) -> Model {
+  rebuild(Model {
+    events: [],
+    buffered: [],
+    cursor: 0,
+    collapsed: [],
+    ..model
+  })
+}
+
+fn toggle_tx(model: Model) -> Model {
+  let Some(tx_id) = model.cursor_tx_id() else {
+    return model
+  }
+  let collapsed = if model.is_collapsed(tx_id) {
+    model.collapsed.filter(|id| id != tx_id)
+  } else {
+    model.collapsed.append(tx_id)
+  }
+  let rebuilt = rebuild(Model { collapsed, ..model })
+  // Keep the cursor on the summary row we just toggled.
+  let cursor = find_summary_row(rebuilt, tx_id).unwrap_or(rebuilt.cursor)
+  Model { cursor: min_int(cursor, last_index(rebuilt)), ..rebuilt }
+}
+
+fn find_summary_row(model: Model, tx_id: string) -> Option<int> {
+  let mut i = 0
+  while i < model.rows.length() {
+    match model.rows[i] {
+      Row.TxSummary { tx_id: id, .. } => {
+        if id == tx_id {
+          return Some(i)
+        }
+      },
+      Row.Event { .. } => (),
+    }
+    i += 1
+  }
+  None
+}
+
+/// If follow-mode is on, snap the cursor to the last row so new traffic stays
+/// visible. If the user has scrolled up, leave the cursor where it is.
+fn stick_to_tail(model: Model) -> Model {
+  if model.follow {
+    Model { cursor: last_index(model), ..model }
+  } else {
+    // Keep the cursor in range even when not following.
+    Model { cursor: min_int(model.cursor, last_index(model)), ..model }
+  }
+}
+
+/// Recompute the display rows from `events` and the collapsed set. Transactions
+/// (identified by a shared tx_id, opened by a Begin op) become a summary row
+/// followed by their member events unless collapsed. Non-tx events are flat.
+pub fn rebuild(model: Model) -> Model {
+  let mut rows: Slice<Row> = []
+  let mut seen: Slice<string> = []
+  let mut i = 0
+  let n = model.events.length()
+
+  while i < n {
+    let ev = model.events[i]
+    match ev.tx_id {
+      Some(tx_id) => {
+        if seen.contains(tx_id) {
+          // Member already emitted under its summary — skip.
+        } else {
+          seen = seen.append(tx_id)
+          let members = tx_members(model.events, tx_id)
+          rows = rows.append(Row.TxSummary { tx_id, members })
+          if !model.is_collapsed(tx_id) {
+            for j in members {
+              rows = rows.append(Row.Event { idx: j })
+            }
+          }
+        }
+      },
+      None => {
+        rows = rows.append(Row.Event { idx: i })
+      },
+    }
+    i += 1
+  }
+
+  Model { rows, ..model }
+}
+
+fn tx_members(events: Slice<event.Event>, tx_id: string) -> Slice<int> {
+  let mut out: Slice<int> = []
+  let mut j = 0
+  while j < events.length() {
+    if event_in_tx(events[j], tx_id) {
+      out = out.append(j)
+    }
+    j += 1
+  }
+  out
+}
+
+fn event_in_tx(ev: event.Event, tx_id: string) -> bool {
+  ev.tx_id.map_or(false, |id| id == tx_id)
+}

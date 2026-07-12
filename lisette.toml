@@ -15,8 +15,8 @@ version = "0.1.0"
 "golang.org/x/mod" = { version = "v0.27.0", via = ["golang.org/x/telemetry", "golang.org/x/tools"] }
 "golang.org/x/net" = { version = "v0.43.0", via = ["golang.org/x/crypto", "golang.org/x/tools"] }
 "golang.org/x/sync" = { version = "v0.17.0", via = ["github.com/jackc/puddle/v2", "golang.org/x/telemetry", "golang.org/x/tools"] }
-"golang.org/x/sys" = { version = "v0.35.0", via = ["golang.org/x/crypto", "golang.org/x/net", "golang.org/x/telemetry", "golang.org/x/term"] }
+"golang.org/x/sys" = { version = "v0.47.0", via = ["golang.org/x/crypto", "golang.org/x/net", "golang.org/x/telemetry", "golang.org/x/term"] }
 "golang.org/x/telemetry" = { version = "v0.0.0-20250807160809-1a19826ec488", via = ["golang.org/x/tools"] }
-"golang.org/x/term" = { version = "v0.34.0", via = ["golang.org/x/crypto", "golang.org/x/net"] }
+"golang.org/x/term" = "v0.45.0"
 "golang.org/x/text" = { version = "v0.29.0", via = ["github.com/jackc/pgx/v5", "golang.org/x/net"] }
 "golang.org/x/tools" = { version = "v0.36.0", via = ["golang.org/x/text"] }

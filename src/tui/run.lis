@@ -1,0 +1,88 @@
+import "go:context"
+import "event"
+
+/// The actor event loop. A single `select` folds three inputs into the model:
+///
+///   - `events`  incoming query traffic (append + redraw)
+///   - `keys`    decoded keypresses (update + redraw)
+///   - ctx.Done  cancellation (restore terminal + return)
+///
+/// `term` owns raw-mode + the alternate screen and paints each frame. The loop
+/// is the *only* writer to the terminal; the key-decoder task is the only
+/// reader — so there is no shared mutable state, just channels.
+///
+/// Cancellation / ctrl+c paths (both restore the terminal via the deferred
+/// `term.restore()`):
+///   - The user presses ctrl+c: `Key.CtrlC` breaks the loop -> return -> defer.
+///   - A signal fires: `ctx.Done()` wins the select -> return -> defer.
+/// Restore is idempotent-safe to run once on whichever path fires first.
+pub fn run(
+  ctx: context.Context,
+  events: Channel<event.Event>,
+  keys: Channel<Key>,
+  term: Terminal,
+) {
+  defer term.restore()
+
+  // Fan the two typed inputs into one Msg inbox. Two shorthand receive arms in
+  // a single select are lint-flagged (ambiguous close behaviour), so we merge
+  // upstream and the loop selects the inbox against cancellation — the actor
+  // still reacts to events, keys, and ctx.Done, just through one channel.
+  let inbox = Channel.buffered<Msg>(64)
+  task fan_in(events, keys, inbox)
+
+  let mut model = Model.new()
+  let size = term.size()
+  term.paint(view(model, size.width, size.height))
+
+  loop {
+    select {
+      let _ = ctx.Done().receive() => { return },
+      let Some(msg) = inbox.receive() => {
+        if quits(msg, model.screen) {
+          return
+        }
+        model = update(model, msg)
+        repaint(term, model)
+      },
+    }
+  }
+}
+
+/// Forward query events and keypresses onto a single Msg inbox. Ends when
+/// either source closes (shutdown closes the key stream by closing stdin).
+fn fan_in(events: Channel<event.Event>, keys: Channel<Key>, inbox: Channel<Msg>) {
+  task {
+    for ev in events {
+      let _ = inbox.send(Msg.Incoming(ev))
+    }
+  }
+  for key in keys {
+    let _ = inbox.send(Msg.Press(key))
+  }
+}
+
+fn quits(msg: Msg, screen: Screen) -> bool {
+  match msg {
+    Msg.Press(key) => is_quit(key, screen),
+    Msg.Incoming(_) => false,
+  }
+}
+
+/// ctrl+c always quits. 'q' quits only from the List view; in Inspect it is a
+/// back action handled by `update`, so we don't intercept it there.
+fn is_quit(key: Key, screen: Screen) -> bool {
+  match key {
+    Key.CtrlC => true,
+    Key.Char('q') => match screen {
+      Screen.List => true,
+      Screen.Inspect => false,
+    },
+    _ => false,
+  }
+}
+
+fn repaint(term: Terminal, model: Model) {
+  let size = term.size()
+  term.paint(view(model, size.width, size.height))
+}

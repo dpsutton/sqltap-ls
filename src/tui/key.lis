@@ -1,0 +1,241 @@
+import "go:os"
+
+/// A decoded key event. Arrow/navigation keys and control chords are named
+/// variants; everything printable rides `Char(rune)`. Owning the byte decoder
+/// means we never see Bubble Tea's split-escape-sequence problem: a whole
+/// read() buffer is decoded at once, and a lone ESC is only ever ESC.
+pub enum Key {
+  Char(rune),
+  Up,
+  Down,
+  Left,
+  Right,
+  PgUp,
+  PgDown,
+  Home,
+  End,
+  Enter,
+  Backspace,
+  Tab,
+  Esc,
+  Space,
+  CtrlC,
+  CtrlD,
+  CtrlU,
+  CtrlL,
+}
+
+/// Decode one read() buffer of raw-mode stdin bytes into a sequence of Keys.
+///
+/// Because a raw-mode read hands us the whole escape sequence in one buffer
+/// (the kernel line discipline is off, but the terminal still emits CSI
+/// sequences atomically per keypress), we decode greedily left-to-right:
+///
+///   - ESC [ A/B/C/D            -> arrows
+///   - ESC [ 5~ / 6~            -> PgUp / PgDown
+///   - ESC [ H/F, ESC [ 1~/4~   -> Home / End
+///   - a lone ESC (buffer ends) -> Esc
+///   - 0x03/0x04/0x15/0x0c      -> Ctrl+C/D/U/L
+///   - 0x0d/0x0a                -> Enter
+///   - 0x7f/0x08                -> Backspace
+///   - 0x09                     -> Tab
+///   - 0x20                     -> Space
+///   - other printable UTF-8    -> Char(rune)
+///
+/// Unknown/partial escape sequences are dropped rather than leaked as garbage
+/// characters — the workaround the Go version needed for split escapes.
+pub fn decode(buf: Slice<byte>) -> Slice<Key> {
+  let n = buf.length()
+  let mut out: Slice<Key> = []
+  let mut i = 0
+
+  while i < n {
+    let c = buf[i]
+
+    if c == 0x1b { // ESC
+      let (key, next) = decode_escape(buf, i)
+      if let Some(k) = key {
+        out = out.append(k)
+      }
+      i = next
+    } else if c == 0x03 {
+      out = out.append(Key.CtrlC)
+      i += 1
+    } else if c == 0x04 {
+      out = out.append(Key.CtrlD)
+      i += 1
+    } else if c == 0x15 {
+      out = out.append(Key.CtrlU)
+      i += 1
+    } else if c == 0x0c {
+      out = out.append(Key.CtrlL)
+      i += 1
+    } else if c == 0x0d || c == 0x0a {
+      out = out.append(Key.Enter)
+      i += 1
+    } else if c == 0x7f || c == 0x08 {
+      out = out.append(Key.Backspace)
+      i += 1
+    } else if c == 0x09 {
+      out = out.append(Key.Tab)
+      i += 1
+    } else if c == 0x20 {
+      out = out.append(Key.Space)
+      i += 1
+    } else if c < 0x20 {
+      // Other control bytes we don't map: skip.
+      i += 1
+    } else {
+      // Printable byte: decode a UTF-8 rune starting here.
+      let (r, width) = decode_rune(buf, i)
+      out = out.append(Key.Char(r))
+      i += width
+    }
+  }
+
+  out
+}
+
+/// Decode a CSI escape sequence starting at `start` (buf[start] == 0x1b).
+/// Returns the decoded key (or None to drop) and the index just past it.
+fn decode_escape(buf: Slice<byte>, start: int) -> (Option<Key>, int) {
+  let n = buf.length()
+
+  // Lone ESC at end of buffer, or ESC not followed by '['.
+  if start + 1 >= n {
+    return (Some(Key.Esc), start + 1)
+  }
+  if buf[start + 1] != 0x5b { // not '['
+    return (Some(Key.Esc), start + 1)
+  }
+
+  // ESC [ ... — scan the CSI body: params (digits, ';') then a final byte.
+  let mut j = start + 2
+  let mut params = ""
+  while j < n {
+    let b = buf[j]
+    if b >= 0x30 && b <= 0x3f { // parameter/intermediate bytes
+      params += byte_to_string(b)
+      j += 1
+    } else {
+      break
+    }
+  }
+  if j >= n {
+    // Truncated CSI — drop it.
+    return (None, j)
+  }
+
+  let final_byte = buf[j]
+  let after = j + 1
+  let key = classify_csi(params, final_byte)
+  (key, after)
+}
+
+/// Map a CSI (params, final byte) to a Key, or None to drop.
+fn classify_csi(params: string, final_byte: byte) -> Option<Key> {
+  if final_byte == 0x41 { return Some(Key.Up) }    // 'A'
+  if final_byte == 0x42 { return Some(Key.Down) }  // 'B'
+  if final_byte == 0x43 { return Some(Key.Right) } // 'C'
+  if final_byte == 0x44 { return Some(Key.Left) }  // 'D'
+  if final_byte == 0x48 { return Some(Key.Home) }  // 'H'
+  if final_byte == 0x46 { return Some(Key.End) }   // 'F'
+  if final_byte == 0x7e { // '~' — numbered keys: ESC [ 5 ~ etc.
+    if params == "5" { return Some(Key.PgUp) }
+    if params == "6" { return Some(Key.PgDown) }
+    if params == "1" || params == "7" { return Some(Key.Home) }
+    if params == "4" || params == "8" { return Some(Key.End) }
+    return None
+  }
+  None
+}
+
+/// Decode one UTF-8 rune at buf[i]; returns the rune and its byte width.
+/// Malformed sequences fall back to a single-byte rune to stay total.
+fn decode_rune(buf: Slice<byte>, i: int) -> (rune, int) {
+  let n = buf.length()
+  let c = buf[i]
+  let width = if c < 0x80 {
+    1
+  } else if c >= 0xf0 {
+    4
+  } else if c >= 0xe0 {
+    3
+  } else if c >= 0xc0 {
+    2
+  } else {
+    1
+  }
+  let end = min_int(i + width, n)
+  let s = slice_to_string(buf, i, end)
+  let runes = s.runes()
+  if runes.length() > 0 {
+    (runes[0], end - i)
+  } else {
+    (c as rune, 1)
+  }
+}
+
+fn byte_to_string(b: byte) -> string {
+  let one: Slice<byte> = [b]
+  one as string
+}
+
+fn slice_to_string(buf: Slice<byte>, lo: int, hi: int) -> string {
+  let mut out: Slice<byte> = []
+  let mut k = lo
+  while k < hi {
+    out = out.append(buf[k])
+    k += 1
+  }
+  out as string
+}
+
+/// Read raw stdin bytes and push decoded Keys onto `out` until the stream
+/// closes or errors (e.g. stdin is closed on shutdown). Runs as a task; the
+/// actor loop selects `out` against its other inboxes. Reads os.Stdin directly
+/// — raw mode is already in effect (see Terminal.enter), so each Read hands us
+/// the raw bytes, including whole escape sequences.
+pub fn read_keys(out: Channel<Key>) {
+  loop {
+    let mut buf: Slice<byte> = new_buffer(64)
+    match os.Stdin.Read(buf) {
+      Partial.Ok(nread) => emit(buf, nread, out),
+      Partial.Both(nread, _) => {
+        emit(buf, nread, out)
+        break
+      },
+      Partial.Err(_) => break,
+    }
+  }
+}
+
+fn emit(buf: Slice<byte>, nread: int, out: Channel<Key>) {
+  if nread <= 0 {
+    return
+  }
+  for k in decode(slice_prefix(buf, nread)) {
+    let _ = out.send(k)
+  }
+}
+
+fn slice_prefix(buf: Slice<byte>, n: int) -> Slice<byte> {
+  let mut out: Slice<byte> = []
+  let mut i = 0
+  while i < n {
+    out = out.append(buf[i])
+    i += 1
+  }
+  out
+}
+
+fn new_buffer(n: int) -> Slice<byte> {
+  let mut out: Slice<byte> = []
+  let mut i = 0
+  let zero: byte = 0
+  while i < n {
+    out = out.append(zero)
+    i += 1
+  }
+  out
+}
