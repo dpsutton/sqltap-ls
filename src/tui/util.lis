@@ -1,0 +1,15 @@
+// Shared helpers and ANSI codes for the tui module. All files in src/tui share
+// one module scope, so these live in one place.
+
+// ANSI styling used by the renderer. (The highlight module keeps its own
+// copies private, so the tui declares the two it needs for chrome.)
+const SGR_BOLD = "\x1b[1m"
+const SGR_RESET = "\x1b[0m"
+
+fn max_int(a: int, b: int) -> int {
+  if a > b { a } else { b }
+}
+
+fn min_int(a: int, b: int) -> int {
+  if a < b { a } else { b }
+}

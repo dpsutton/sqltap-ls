@@ -1,0 +1,116 @@
+import "go:fmt"
+import "go:time"
+import "go:strings"
+import "event"
+
+/// Format a duration the way the Go list view does:
+///   < 1ms  -> "123µs"
+///   < 1s   -> "45.6ms"
+///   else   -> "1.23s"
+/// Ported from formatDurationValue.
+pub fn duration(d: time.Duration) -> string {
+  let micros = d.Microseconds()
+  if d < time.Millisecond {
+    fmt.Sprintf("%dµs", micros)
+  } else if d < time.Second {
+    let ms = (micros as float64) / 1000.0
+    fmt.Sprintf("%.1fms", ms)
+  } else {
+    fmt.Sprintf("%.2fs", d.Seconds())
+  }
+}
+
+/// HH:MM:SS.mmm in local time, matching the Go list column.
+pub fn clock(t: time.Time) -> string {
+  t.In(time.Local).Format("15:04:05.000")
+}
+
+/// Collapse runs of whitespace, then truncate to `max_len` runes with an
+/// ellipsis. Mirrors the Go `truncate` helper (rune-aware here).
+pub fn truncate(s: string, max_len: int) -> string {
+  let flat = collapse_ws(s)
+  let runes = flat.runes()
+  if runes.length() <= max_len {
+    return flat
+  }
+  if max_len <= 1 {
+    return runes_to_string(runes, 0, max_len)
+  }
+  runes_to_string(runes, 0, max_len - 1) + "…"
+}
+
+fn collapse_ws(s: string) -> string {
+  let trimmed = strings.TrimSpace(s)
+  let mut out = ""
+  let mut prev_space = false
+  for r in trimmed.runes() {
+    if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+      if !prev_space {
+        out += " "
+      }
+      prev_space = true
+    } else {
+      out += r as string
+      prev_space = false
+    }
+  }
+  out
+}
+
+fn runes_to_string(runes: Slice<rune>, lo: int, hi: int) -> string {
+  let mut out = ""
+  let mut i = lo
+  let end = if hi > runes.length() { runes.length() } else { hi }
+  while i < end {
+    out += runes[i] as string
+    i += 1
+  }
+  out
+}
+
+/// Right-pad `s` (measured in runes) to `width` with spaces.
+pub fn pad_right(s: string, width: int) -> string {
+  let w = s.runes().length()
+  if w >= width {
+    s
+  } else {
+    s + strings.Repeat(" ", width - w)
+  }
+}
+
+/// Left-pad `s` (measured in runes) to `width` with spaces.
+pub fn pad_left(s: string, width: int) -> string {
+  let w = s.runes().length()
+  if w >= width {
+    s
+  } else {
+    strings.Repeat(" ", width - w) + s
+  }
+}
+
+/// The short op label shown in the Op column.
+pub fn op_label(op: event.Op) -> string {
+  match op {
+    event.Op.Query => "Query",
+    event.Op.Exec => "Exec",
+    event.Op.Prepare => "Prepare",
+    event.Op.Bind => "Bind",
+    event.Op.Execute => "Execute",
+    event.Op.Begin => "Begin",
+    event.Op.Commit => "Commit",
+    event.Op.Rollback => "Rollback",
+  }
+}
+
+/// The status glyph for an event: E (error), N+1, SLOW, or blank.
+pub fn status_label(ev: event.Event) -> string {
+  if ev.outcome.is_failed() {
+    "E"
+  } else if ev.nplus1 {
+    "N+1"
+  } else if ev.slow {
+    "SLOW"
+  } else {
+    ""
+  }
+}

@@ -1,0 +1,210 @@
+import "go:time"
+import "event"
+
+// --- fixtures ------------------------------------------------------------
+
+fn ev(id: string, op: event.Op, query: string, tx: Option<string>) -> event.Event {
+  event.Event {
+    id,
+    op,
+    query,
+    args: [],
+    start_time: time.Date(2026, time.July, 12, 10, 0, 0, 0, time.UTC),
+    duration: 100 * time.Microsecond,
+    outcome: event.Outcome.Ok { rows_affected: 1 },
+    tx_id: tx,
+    nplus1: false,
+    slow: false,
+    normalized_query: query,
+  }
+}
+
+/// Feed a list of events into a fresh model via update(Incoming), as the live
+/// loop would.
+fn feed(events: Slice<event.Event>) -> Model {
+  let mut m = Model.new()
+  for e in events {
+    m = update(m, Msg.Incoming(e))
+  }
+  m
+}
+
+fn press(m: Model, key: Key) -> Model {
+  update(m, Msg.Press(key))
+}
+
+// --- follow-mode & incoming events --------------------------------------
+
+#[test("new model follows the tail")]
+fn test_new_follows() {
+  let m = Model.new()
+  assert m.follow
+  assert !m.paused
+  assert m.rows.is_empty()
+}
+
+#[test("incoming events stick the cursor to the bottom while following")]
+fn test_follow_sticks() {
+  let m = feed([
+    ev("a", event.Op.Query, "SELECT 1", None),
+    ev("b", event.Op.Query, "SELECT 2", None),
+    ev("c", event.Op.Query, "SELECT 3", None),
+  ])
+  assert m.rows.length() == 3
+  assert m.follow
+  assert m.cursor == 2 // last row
+}
+
+#[test("scrolling up disengages follow and freezes the cursor")]
+fn test_scroll_up_disengages() {
+  let mut m = feed([
+    ev("a", event.Op.Query, "SELECT 1", None),
+    ev("b", event.Op.Query, "SELECT 2", None),
+    ev("c", event.Op.Query, "SELECT 3", None),
+  ])
+  m = press(m, Key.Up)
+  assert !m.follow
+  assert m.cursor == 1
+
+  // A new event arrives; cursor must NOT jump to the bottom.
+  m = update(m, Msg.Incoming(ev("d", event.Op.Query, "SELECT 4", None)))
+  assert !m.follow
+  assert m.cursor == 1
+  assert m.rows.length() == 4
+}
+
+#[test("navigating back to the bottom re-engages follow")]
+fn test_down_reengages() {
+  let mut m = feed([
+    ev("a", event.Op.Query, "SELECT 1", None),
+    ev("b", event.Op.Query, "SELECT 2", None),
+  ])
+  m = press(m, Key.Up) // cursor 0, follow off
+  assert !m.follow
+  m = press(m, Key.Down) // back to last row
+  assert m.follow
+  assert m.cursor == 1
+}
+
+#[test("up at the top is a no-op")]
+fn test_up_at_top() {
+  let mut m = feed([ev("a", event.Op.Query, "SELECT 1", None)])
+  m = press(m, Key.Up)
+  m = press(m, Key.Up)
+  assert m.cursor == 0
+}
+
+// --- pause buffering -----------------------------------------------------
+
+#[test("pause holds new events aside, unpause flushes them in order")]
+fn test_pause_buffering() {
+  let mut m = feed([ev("a", event.Op.Query, "SELECT 1", None)])
+  m = press(m, Key.Char('p'))
+  assert m.paused
+
+  m = update(m, Msg.Incoming(ev("b", event.Op.Query, "SELECT 2", None)))
+  m = update(m, Msg.Incoming(ev("c", event.Op.Query, "SELECT 3", None)))
+  // Still only the pre-pause event is visible.
+  assert m.rows.length() == 1
+  assert m.buffered.length() == 2
+
+  m = press(m, Key.Char('p')) // unpause
+  assert !m.paused
+  assert m.buffered.is_empty()
+  assert m.rows.length() == 3
+  assert m.events[1].id == "b"
+  assert m.events[2].id == "c"
+}
+
+// --- clear ---------------------------------------------------------------
+
+#[test("ctrl+l clears events, rows, and cursor")]
+fn test_clear() {
+  let mut m = feed([
+    ev("a", event.Op.Query, "SELECT 1", None),
+    ev("b", event.Op.Query, "SELECT 2", None),
+  ])
+  m = press(m, Key.CtrlL)
+  assert m.events.is_empty()
+  assert m.rows.is_empty()
+  assert m.cursor == 0
+}
+
+// --- transaction grouping & toggle --------------------------------------
+
+fn tx_model() -> Model {
+  feed([
+    ev("q0", event.Op.Query, "SELECT before", None),
+    ev("b", event.Op.Begin, "BEGIN", Some("t1")),
+    ev("q1", event.Op.Query, "SELECT a", Some("t1")),
+    ev("q2", event.Op.Query, "SELECT b", Some("t1")),
+    ev("c", event.Op.Commit, "COMMIT", Some("t1")),
+  ])
+}
+
+#[test("a transaction becomes a summary row followed by its members")]
+fn test_tx_grouping() {
+  let m = tx_model()
+  // row 0: standalone query; row 1: Tx summary; rows 2-5: 4 tx members.
+  assert m.rows.length() == 6
+  let assert Row.Event { .. } = m.rows[0]
+  let assert Row.TxSummary { tx_id: "t1", .. } = m.rows[1]
+  let assert Row.Event { .. } = m.rows[2]
+}
+
+#[test("space on a tx summary collapses and re-expands it")]
+fn test_tx_toggle() {
+  let mut m = tx_model()
+  // Move cursor onto the summary row (index 1).
+  m = Model { cursor: 1, follow: false, ..m }
+
+  m = press(m, Key.Space) // collapse
+  assert m.collapsed.contains("t1")
+  // Summary row remains, members are hidden: standalone + summary only.
+  assert m.rows.length() == 2
+  let assert Row.TxSummary { tx_id: "t1", .. } = m.rows[1]
+  assert m.cursor == 1 // cursor stayed on the summary
+
+  m = press(m, Key.Space) // expand
+  assert !m.collapsed.contains("t1")
+  assert m.rows.length() == 6
+}
+
+#[test("space off a tx row does nothing")]
+fn test_toggle_noop() {
+  let mut m = tx_model()
+  m = Model { cursor: 0, follow: false, ..m } // standalone query row
+  let before = m.rows.length()
+  m = press(m, Key.Space)
+  assert m.rows.length() == before
+  assert m.collapsed.is_empty()
+}
+
+// --- inspect view transition --------------------------------------------
+
+#[test("enter on an event row opens Inspect, q returns to List")]
+fn test_inspect_roundtrip() {
+  let mut m = feed([ev("a", event.Op.Query, "SELECT 1", None)])
+  m = press(m, Key.Enter)
+  let assert Screen.Inspect = m.screen
+
+  m = press(m, Key.Char('q'))
+  let assert Screen.List = m.screen
+}
+
+#[test("enter on a tx summary row stays in List (no detail yet)")]
+fn test_inspect_summary_noop() {
+  let mut m = tx_model()
+  m = Model { cursor: 1, follow: false, ..m } // summary row
+  m = press(m, Key.Enter)
+  let assert Screen.List = m.screen
+}
+
+#[test("cursor_event returns the event on an event row, None on a summary")]
+fn test_cursor_event() {
+  let mut m = tx_model()
+  m = Model { cursor: 0, follow: false, ..m }
+  let assert Some(_) = m.cursor_event()
+  m = Model { cursor: 1, ..m }
+  let assert None = m.cursor_event()
+}

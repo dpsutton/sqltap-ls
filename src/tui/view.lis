@@ -1,0 +1,356 @@
+import "go:strings"
+import "go:time"
+import "event"
+import "highlight"
+
+// Column widths, matching the Go list view.
+const COL_MARKER = 2 // "▶ " or "  "
+const COL_OP = 9
+const COL_DURATION = 10
+const COL_TIME = 12
+const COL_STATUS = 4
+
+// ESC (0x1b) as a rune, for skipping ANSI escape sequences when measuring
+// visible width. Rune literals don't accept \x escapes; a const can't hold a
+// cast; so compute it once via a helper.
+fn esc_rune() -> rune {
+  0x1b as rune
+}
+
+/// Render the whole frame for `model` at a fixed terminal size. Pure: the same
+/// model and size always produce the same string, so view() is unit-testable.
+/// A single string is returned; the actor loop writes it in one paint().
+pub fn view(model: Model, width: int, height: int) -> string {
+  match model.screen {
+    Screen.List => view_list(model, width, height),
+    Screen.Inspect => view_inspect(model, width, height),
+  }
+}
+
+fn view_list(model: Model, width: int, height: int) -> string {
+  let inner = max_int(width - 4, 20)
+  let col_query = max_int(
+    inner - COL_MARKER - COL_OP - COL_DURATION - COL_TIME - COL_STATUS - 4,
+    10,
+  )
+
+  // Reserve lines: footer (1) + preview box (~7). The rest is the list.
+  let footer_lines = 1
+  let preview_lines = 7
+  let list_height = max_int(height - preview_lines - footer_lines - 2, 3)
+  let data_rows = max_int(list_height - 1, 1) // -1 for the header row
+
+  let header = list_box(model, inner, col_query, data_rows)
+  let preview = preview_pane(model, inner)
+  let footer = footer_line(model, width)
+
+  strings.Join([header, preview, footer], "\n")
+}
+
+fn list_box(model: Model, inner: int, col_query: int, data_rows: int) -> string {
+  let title = title_line(model)
+
+  // Scroll window: keep the cursor roughly centered.
+  let total = model.rows.length()
+  let mut start = 0
+  if total > data_rows {
+    start = max_int(model.cursor - data_rows / 2, 0)
+    if start + data_rows > total {
+      start = total - data_rows
+    }
+  }
+  let end = min_int(start + data_rows, total)
+
+  let header_row = f"{SGR_BOLD}{list_header(col_query)}{SGR_RESET}"
+  let mut lines: Slice<string> = [header_row]
+  let mut i = start
+  while i < end {
+    lines = lines.append(render_row(model, i, col_query))
+    i += 1
+  }
+
+  let content = strings.Join(lines, "\n")
+  bordered_titled(content, title, inner)
+}
+
+fn title_line(model: Model) -> string {
+  let n = model.events.length()
+  let mut t = f" sql-tap ({n} queries) "
+  if model.paused {
+    t += "[PAUSED] "
+  }
+  t
+}
+
+fn list_header(col_query: int) -> string {
+  let op = pad_right("Op", COL_OP)
+  let q = pad_right("Query", col_query)
+  let d = pad_left("Duration", COL_DURATION)
+  let t = pad_left("Time", COL_TIME)
+  f"  {op} {q} {d} {t}"
+}
+
+fn render_row(model: Model, i: int, col_query: int) -> string {
+  let is_cursor = i == model.cursor
+  match model.rows[i] {
+    Row.TxSummary { tx_id, members } => render_tx_summary(model, tx_id, members, is_cursor, col_query),
+    Row.Event { idx } => render_event_row(model, idx, is_cursor, col_query, false),
+  }
+}
+
+fn render_tx_summary(model: Model, tx_id: string, members: Slice<int>, is_cursor: bool, col_query: int) -> string {
+  let marker = if is_cursor { "▶ " } else { "  " }
+  let chevron = if model_collapsed(model, tx_id) { "▸ " } else { "▾ " }
+  let nq = tx_query_count(model, members)
+  let label = if nq == 1 { "1 query" } else { f"{nq} queries" }
+  let first = model.events[members[0]]
+  let dur = duration(tx_wall_duration(model, members))
+  let t = clock(first.start_time)
+
+  let op = pad_right("Tx", COL_OP)
+  let q = pad_right(label, col_query)
+  let d = pad_left(dur, COL_DURATION)
+  let tm = pad_left(t, COL_TIME)
+  let line = f"{marker}{chevron}{op} {q} {d} {tm}"
+  if is_cursor { f"{SGR_BOLD}{line}{SGR_RESET}" } else { line }
+}
+
+fn render_event_row(model: Model, idx: int, is_cursor: bool, col_query: int, force_child: bool) -> string {
+  let ev = model.events[idx]
+  let marker = if is_cursor { "▶ " } else { "  " }
+  let is_child = force_child || ev.tx_id.is_some()
+  let indent = if is_child { "  " } else { "" }
+  let cq = if is_child { max_int(col_query - 2, 1) } else { col_query }
+
+  let raw_q = truncate(ev.query, cq)
+  let q = if raw_q == "" { "-" } else { raw_q }
+
+  let op = pad_right(op_label(ev.op), COL_OP)
+  let qcol = pad_right(q, cq)
+  let d = pad_left(duration(ev.duration), COL_DURATION)
+  let t = pad_left(clock(ev.start_time), COL_TIME)
+  let status = status_label(ev)
+  let line = f"{marker}{indent}{op} {qcol} {d} {t} {status}"
+  if is_cursor { f"{SGR_BOLD}{line}{SGR_RESET}" } else { line }
+}
+
+fn preview_pane(model: Model, inner: int) -> string {
+  if model.cursor < 0 || model.cursor >= model.rows.length() {
+    return bordered("", inner)
+  }
+  let content = match model.rows[model.cursor] {
+    Row.TxSummary { tx_id, members } => tx_preview(model, tx_id, members, inner),
+    Row.Event { idx } => event_preview(model, idx, inner),
+  }
+  bordered(content, inner)
+}
+
+fn event_preview(model: Model, idx: int, inner: int) -> string {
+  let ev = model.events[idx]
+  let mut lines: Slice<string> = [f"Op:       {op_label(ev.op)}"]
+
+  if ev.query != "" {
+    let max_q = max_int(inner - 10, 20)
+    lines = lines.append(f"Query:    {highlight.sql(truncate(ev.query, max_q))}")
+  }
+  if !ev.args.is_empty() {
+    let args = strings.Join(ev.args, ", ")
+    lines = lines.append(f"Args:     [{args}]")
+  }
+  lines = lines.append(f"Duration: {duration(ev.duration)}")
+  if let Some(msg) = ev.outcome.error_message() {
+    lines = lines.append(f"Error:    {msg}")
+  }
+  if let Some(tx) = ev.tx_id {
+    lines = lines.append(f"Tx:       {tx}")
+  }
+  strings.Join(lines, "\n")
+}
+
+fn tx_preview(model: Model, tx_id: string, members: Slice<int>, inner: int) -> string {
+  let nq = tx_query_count(model, members)
+  let label = if nq == 1 { "1 query" } else { f"{nq} queries" }
+  let mut lines: Slice<string> = [
+    "Type:     Transaction",
+    f"Queries:  {label}",
+    f"Duration: {duration(tx_wall_duration(model, members))}",
+    f"Tx:       {tx_id}",
+  ]
+  let max_q = max_int(inner - 14, 20)
+  for j in members {
+    let ev = model.events[j]
+    if ev.op.is_query() {
+      let q = truncate(ev.query, max_q)
+      lines = lines.append(f"  {pad_right(op_label(ev.op), 8)} {highlight.sql(q)}")
+    }
+  }
+  strings.Join(lines, "\n")
+}
+
+fn footer_line(model: Model, width: int) -> string {
+  let hints = "  q: quit  j/k: nav  space: tx  enter: inspect  p: pause  ctrl+l: clear"
+  let flat = truncate(hints, max_int(width - 2, 10))
+  if model.paused {
+    f"{flat}  {SGR_BOLD}[PAUSED]{SGR_RESET}"
+  } else {
+    flat
+  }
+}
+
+fn view_inspect(model: Model, width: int, _height: int) -> string {
+  let inner = max_int(width - 4, 20)
+  let content = model.cursor_event().map_or("No event selected.", |ev| inspect_body(ev, inner))
+  let box = bordered_titled(content, " inspect ", inner)
+  let footer = "  q/esc: back"
+  strings.Join([box, footer], "\n")
+}
+
+fn inspect_body(ev: event.Event, inner: int) -> string {
+  let max_q = max_int(inner - 4, 20)
+  let mut lines: Slice<string> = [
+    f"Op:        {op_label(ev.op)}",
+    f"ID:        {ev.id}",
+  ]
+  if ev.query != "" {
+    lines = lines.append("Query:")
+    lines = lines.append(f"  {highlight.sql(truncate(ev.query, max_q))}")
+  }
+  if !ev.args.is_empty() {
+    let args = strings.Join(ev.args, ", ")
+    lines = lines.append(f"Args:      [{args}]")
+  }
+  lines = lines.append(f"Duration:  {duration(ev.duration)}")
+  lines = lines.append(f"Rows:      {ev.outcome.rows()}")
+  if let Some(msg) = ev.outcome.error_message() {
+    lines = lines.append(f"Error:     {msg}")
+  }
+  if let Some(tx) = ev.tx_id {
+    lines = lines.append(f"Tx:        {tx}")
+  }
+  if ev.nplus1 {
+    lines = lines.append("Flags:     N+1")
+  }
+  if ev.slow {
+    lines = lines.append("Flags:     SLOW")
+  }
+  strings.Join(lines, "\n")
+}
+
+// --- transaction metrics -------------------------------------------------
+
+fn tx_query_count(model: Model, members: Slice<int>) -> int {
+  let mut n = 0
+  for idx in members {
+    if model.events[idx].op.is_query() {
+      n += 1
+    }
+  }
+  n
+}
+
+fn tx_wall_duration(model: Model, members: Slice<int>) -> time.Duration {
+  if members.is_empty() {
+    return 0 as time.Duration
+  }
+  let first = model.events[members[0]]
+  let last = model.events[members[members.length() - 1]]
+  let start = first.start_time
+  let end = last.start_time.Add(last.duration)
+  end.Sub(start)
+}
+
+// --- box drawing ---------------------------------------------------------
+
+fn bordered(content: string, inner: int) -> string {
+  bordered_titled(content, "", inner)
+}
+
+/// Draw a rounded-border box `inner` cells wide around `content`. If `title`
+/// is non-empty it replaces the middle of the top border. Each content line is
+/// padded/truncated to the inner width (by visible rune count, ignoring ANSI).
+fn bordered_titled(content: string, title: string, inner: int) -> string {
+  let full_bar = strings.Repeat("─", inner)
+  let top = if title == "" {
+    f"╭{full_bar}╮"
+  } else {
+    let dashes = max_int(inner - visible_len(title), 0)
+    let bar = strings.Repeat("─", dashes)
+    f"╭{title}{bar}╮"
+  }
+  let bottom = f"╰{full_bar}╯"
+
+  let mut out: Slice<string> = [top]
+  for line in content.split("\n") {
+    let padded = pad_visible(line, inner)
+    out = out.append(f"│{padded}│")
+  }
+  out = out.append(bottom)
+  strings.Join(out, "\n")
+}
+
+/// Pad `s` to `width` visible cells, or truncate to it, ignoring ANSI escapes.
+fn pad_visible(s: string, width: int) -> string {
+  let vis = visible_len(s)
+  if vis == width {
+    s
+  } else if vis < width {
+    s + strings.Repeat(" ", width - vis)
+  } else {
+    truncate_visible(s, width)
+  }
+}
+
+/// Count visible runes, skipping ANSI SGR escape sequences (ESC [ ... m).
+pub fn visible_len(s: string) -> int {
+  let esc = esc_rune()
+  let mut n = 0
+  let mut in_escape = false
+  for r in s.runes() {
+    if in_escape {
+      if r == 'm' {
+        in_escape = false
+      }
+    } else if r == esc {
+      in_escape = true
+    } else {
+      n += 1
+    }
+  }
+  n
+}
+
+/// Truncate `s` to `width` visible runes, preserving ANSI escapes and
+/// appending a reset so a cut mid-color doesn't bleed.
+fn truncate_visible(s: string, width: int) -> string {
+  let esc = esc_rune()
+  let mut out = ""
+  let mut n = 0
+  let mut in_escape = false
+  let mut saw_escape = false
+  for r in s.runes() {
+    if n >= width {
+      break
+    }
+    if in_escape {
+      out += r as string
+      if r == 'm' {
+        in_escape = false
+      }
+    } else if r == esc {
+      in_escape = true
+      saw_escape = true
+      out += r as string
+    } else {
+      out += r as string
+      n += 1
+    }
+  }
+  if saw_escape {
+    out += SGR_RESET
+  }
+  out
+}
+
+fn model_collapsed(model: Model, tx_id: string) -> bool {
+  model.collapsed.contains(tx_id)
+}

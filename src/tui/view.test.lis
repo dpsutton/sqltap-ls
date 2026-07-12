@@ -1,0 +1,189 @@
+import "go:time"
+import "go:strings"
+import "event"
+
+// --- ANSI stripping helper (for contains-checks on styled output) --------
+
+fn strip_ansi(s: string) -> string {
+  let esc = esc_rune()
+  let mut out = ""
+  let mut in_escape = false
+  for r in s.runes() {
+    if in_escape {
+      if r == 'm' {
+        in_escape = false
+      }
+    } else if r == esc {
+      in_escape = true
+    } else {
+      out += r as string
+    }
+  }
+  out
+}
+
+fn vev(id: string, op: event.Op, query: string, dur: time.Duration, tx: Option<string>) -> event.Event {
+  event.Event {
+    id,
+    op,
+    query,
+    args: [],
+    start_time: time.Date(2026, time.July, 12, 9, 15, 30, 0, time.UTC),
+    duration: dur,
+    outcome: event.Outcome.Ok { rows_affected: 2 },
+    tx_id: tx,
+    nplus1: false,
+    slow: false,
+    normalized_query: query,
+  }
+}
+
+fn model_with(events: Slice<event.Event>) -> Model {
+  let mut m = Model.new()
+  for e in events {
+    m = update(m, Msg.Incoming(e))
+  }
+  m
+}
+
+// --- duration formatting (port of formatDurationValue) -------------------
+
+#[test("duration: sub-millisecond renders as microseconds")]
+fn test_dur_micros() {
+  assert duration(123 * time.Microsecond) == "123µs"
+}
+
+#[test("duration: sub-second renders as milliseconds with one decimal")]
+fn test_dur_millis() {
+  assert duration(45600 * time.Microsecond) == "45.6ms"
+}
+
+#[test("duration: >= 1s renders as seconds with two decimals")]
+fn test_dur_seconds() {
+  assert duration(1230 * time.Millisecond) == "1.23s"
+}
+
+// --- truncation ----------------------------------------------------------
+
+#[test("truncate collapses whitespace and ellipsizes")]
+fn test_truncate() {
+  assert truncate("SELECT   *   FROM   t", 100) == "SELECT * FROM t"
+  // width 10 = 9 kept runes + ellipsis; the 9th kept rune is a space.
+  assert truncate("SELECT * FROM very_long_table_name", 10) == "SELECT * …"
+}
+
+// --- visible_len ignores ANSI --------------------------------------------
+
+#[test("visible_len ignores ANSI escape sequences")]
+fn test_visible_len() {
+  let styled = f"{SGR_BOLD}abc{SGR_RESET}"
+  assert visible_len(styled) == 3
+  assert visible_len("hello") == 5
+}
+
+// --- list view rendering -------------------------------------------------
+
+#[test("list view shows the header row and query count")]
+fn test_list_header() {
+  let m = model_with([
+    vev("a", event.Op.Query, "SELECT * FROM users", 120 * time.Microsecond, None),
+  ])
+  let frame = strip_ansi(view(m, 100, 24))
+  assert frame.contains("sql-tap (1 queries)")
+  assert frame.contains("Op")
+  assert frame.contains("Query")
+  assert frame.contains("Duration")
+  assert frame.contains("Time")
+  assert frame.contains("SELECT * FROM users")
+  assert frame.contains("120µs")
+}
+
+#[test("cursor row is marked with the ▶ glyph")]
+fn test_cursor_marker() {
+  let m = model_with([
+    vev("a", event.Op.Query, "SELECT 1", 120 * time.Microsecond, None),
+  ])
+  let frame = strip_ansi(view(m, 100, 24))
+  assert frame.contains("▶")
+}
+
+#[test("long queries are truncated with an ellipsis in the row")]
+fn test_row_truncation() {
+  let long = "SELECT column_one, column_two, column_three, column_four FROM a_really_wide_table"
+  let m = model_with([vev("a", event.Op.Query, long, 120 * time.Microsecond, None)])
+  // Narrow terminal forces truncation of the query column.
+  let frame = strip_ansi(view(m, 60, 24))
+  assert frame.contains("…")
+  assert !frame.contains("a_really_wide_table")
+}
+
+#[test("paused model shows [PAUSED] in the title and footer")]
+fn test_paused_marker() {
+  let mut m = model_with([vev("a", event.Op.Query, "SELECT 1", 120 * time.Microsecond, None)])
+  m = update(m, Msg.Press(Key.Char('p')))
+  let frame = strip_ansi(view(m, 100, 24))
+  assert frame.contains("[PAUSED]")
+}
+
+#[test("transaction summary row shows chevron and query count")]
+fn test_tx_summary_render() {
+  let m = model_with([
+    vev("b", event.Op.Begin, "BEGIN", 30 * time.Microsecond, Some("t1")),
+    vev("q1", event.Op.Query, "SELECT a", 200 * time.Microsecond, Some("t1")),
+    vev("q2", event.Op.Query, "SELECT b", 300 * time.Microsecond, Some("t1")),
+    vev("c", event.Op.Commit, "COMMIT", 20 * time.Microsecond, Some("t1")),
+  ])
+  let frame = strip_ansi(view(m, 100, 24))
+  assert frame.contains("Tx")
+  assert frame.contains("▾") // expanded chevron
+  assert frame.contains("2 queries") // two OpQuery members
+}
+
+#[test("preview pane shows the selected event's fields")]
+fn test_preview() {
+  let m = model_with([
+    vev("a", event.Op.Query, "SELECT id FROM t", 4500 * time.Microsecond, None),
+  ])
+  let frame = strip_ansi(view(m, 100, 24))
+  assert frame.contains("Op:")
+  assert frame.contains("Query:")
+  assert frame.contains("Duration:")
+  assert frame.contains("4.5ms")
+}
+
+#[test("footer lists key hints")]
+fn test_footer() {
+  let m = model_with([vev("a", event.Op.Query, "SELECT 1", 120 * time.Microsecond, None)])
+  let frame = strip_ansi(view(m, 120, 24))
+  assert frame.contains("q: quit")
+  assert frame.contains("j/k")
+}
+
+// --- inspect view rendering ----------------------------------------------
+
+#[test("inspect view renders full detail and a back hint")]
+fn test_inspect_render() {
+  let mut m = model_with([
+    vev("evt-1", event.Op.Query, "SELECT * FROM orders", 900 * time.Microsecond, None),
+  ])
+  m = update(m, Msg.Press(Key.Enter))
+  let frame = strip_ansi(view(m, 100, 24))
+  assert frame.contains("inspect")
+  assert frame.contains("evt-1")
+  assert frame.contains("SELECT * FROM orders")
+  assert frame.contains("Rows:")
+  assert frame.contains("q/esc: back")
+}
+
+#[test("every list frame line fits within the terminal width")]
+fn test_frame_width_bound() {
+  let m = model_with([
+    vev("a", event.Op.Query, "SELECT 1", 120 * time.Microsecond, None),
+    vev("b", event.Op.Exec, "UPDATE t SET x = 1", 5 * time.Millisecond, None),
+  ])
+  let width = 80
+  let frame = view(m, width, 24)
+  for line in strings.Split(frame, "\n") {
+    assert visible_len(line) <= width
+  }
+}

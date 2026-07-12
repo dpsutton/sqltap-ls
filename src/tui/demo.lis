@@ -1,0 +1,106 @@
+import "go:context"
+import "go:os"
+import "go:os/signal"
+import "go:syscall"
+import "go:time"
+import "go:fmt"
+import "event"
+
+/// Manual live check: `lis build` then `./target/bin/sqltap-ls` *if* main.lis
+/// is temporarily pointed here (revert before committing). Enters raw mode,
+/// feeds fake traffic at ~20 events/s, and drives the real actor loop so you
+/// can navigate with j/k/arrows, toggle tx with space, pause with p, inspect
+/// with enter, and quit with q or ctrl+c.
+///
+/// Wiring `sqltap watch` (real `client.watch` receiver in place of the fake
+/// feed) comes later; the loop signature already takes the events channel.
+#[allow(lost_cancel)]
+pub fn demo() {
+  // SIGINT/SIGTERM cancel the context; the loop's ctx.Done() arm restores the
+  // terminal. Drop the CancelFunc: this is a process-lifetime signal context.
+  let (ctx, _) = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+
+  let term = match Terminal.enter() {
+    Ok(t) => t,
+    Err(e) => {
+      let _ = fmt.Fprintln(os.Stderr, f"sql-tap: cannot enter raw mode: {e}")
+      return
+    },
+  }
+
+  let events = Channel.buffered<event.Event>(64)
+  let keys = Channel.new<Key>()
+
+  // Reader task: raw stdin bytes -> decoded Keys. Reads os.Stdin directly.
+  task read_keys(keys)
+
+  // Fake traffic generator, cancelled with the context.
+  task feed_fake_events(ctx, events)
+
+  run(ctx, events, keys, term)
+}
+
+/// Emit a repeating cycle of synthetic events (a couple of standalone queries
+/// then a small transaction) at ~20/s until the context is cancelled.
+fn feed_fake_events(ctx: context.Context, out: Channel<event.Event>) {
+  let samples = sample_events()
+  let ticker = time.NewTicker(50 * time.Millisecond)
+  defer ticker.Stop()
+  let mut i = 0
+  loop {
+    select {
+      let _ = ctx.Done().receive() => { return },
+      let _ = ticker.C.receive() => {
+        let _ = out.send(samples[i % samples.length()])
+        i += 1
+      },
+    }
+  }
+}
+
+/// A deterministic set of fake events used by the demo feed and by tests.
+pub fn sample_events() -> Slice<event.Event> {
+  let base = time.Date(2026, time.July, 12, 10, 30, 0, 0, time.UTC)
+  [
+    mk_event("e1", event.Op.Query, "SELECT * FROM users WHERE id = $1", ["42"], base, 120 * time.Microsecond, None, false, false, false),
+    mk_event("e2", event.Op.Exec, "UPDATE users SET seen_at = now() WHERE id = $1", ["42"], base.Add(1 * time.Second), 4500 * time.Microsecond, None, false, false, false),
+    mk_event("e3", event.Op.Begin, "BEGIN", [], base.Add(2 * time.Second), 30 * time.Microsecond, Some("tx-1"), false, false, false),
+    mk_event("e4", event.Op.Query, "SELECT id FROM orders WHERE user_id = $1", ["42"], base.Add(2 * time.Second), 900 * time.Microsecond, Some("tx-1"), false, false, false),
+    mk_event("e5", event.Op.Query, "SELECT * FROM order_items WHERE order_id = $1", ["7"], base.Add(2 * time.Second), 2200 * time.Microsecond, Some("tx-1"), true, false, false),
+    mk_event("e6", event.Op.Commit, "COMMIT", [], base.Add(3 * time.Second), 40 * time.Microsecond, Some("tx-1"), false, false, false),
+    mk_event("e7", event.Op.Query, "SELECT count(*) FROM big_table", [], base.Add(4 * time.Second), 1_500_000 * time.Microsecond, None, false, true, false),
+    mk_event("e8", event.Op.Exec, "DELETE FROM sessions WHERE expired", [], base.Add(5 * time.Second), 800 * time.Microsecond, None, false, false, true),
+  ]
+}
+
+fn mk_event(
+  id: string,
+  op: event.Op,
+  query: string,
+  args: Slice<string>,
+  start: time.Time,
+  dur: time.Duration,
+  tx_id: Option<string>,
+  nplus1: bool,
+  slow: bool,
+  failed: bool,
+) -> event.Event {
+  let outcome = if failed {
+    event.Outcome.Failed { message: "syntax error at or near \"FROM\"" }
+  } else {
+    event.Outcome.Ok { rows_affected: 3 }
+  }
+  event.Event {
+    id,
+    op,
+    query,
+    args,
+    start_time: start,
+    duration: dur,
+    outcome,
+    tx_id,
+    nplus1,
+    slow,
+    normalized_query: query,
+  }
+}

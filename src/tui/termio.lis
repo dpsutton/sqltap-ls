@@ -1,0 +1,65 @@
+import "go:os"
+import "go:fmt"
+import "go:golang.org/x/term"
+
+// ANSI control sequences for full-screen raw-terminal rendering.
+const ALT_SCREEN_ENTER = "\x1b[?1049h"
+const ALT_SCREEN_LEAVE = "\x1b[?1049l"
+const CURSOR_HIDE = "\x1b[?25l"
+const CURSOR_SHOW = "\x1b[?25h"
+const CLEAR_HOME = "\x1b[H\x1b[2J"
+const CURSOR_HOME = "\x1b[H"
+
+/// The size of the terminal in character cells.
+pub struct Size {
+  pub width: int,
+  pub height: int,
+}
+
+/// A terminal handle: raw-mode lifecycle plus a frame writer. Kept behind a
+/// tiny abstraction so the actor loop and tests never touch os.Stdin/Stdout
+/// directly — a headless render just calls `frame_string` on a Model instead.
+pub struct Terminal {
+  fd: int,
+  saved: Ref<term.State>,
+}
+
+impl Terminal {
+  /// Put stdin into raw mode and switch to the alternate screen, hiding the
+  /// cursor. Returns the handle whose `restore` undoes all of it. The caller
+  /// is responsible for `defer`-ing `restore` (see run.lis).
+  pub fn enter() -> Result<Terminal, error> {
+    let fd = os.Stdin.Fd() as int
+    let saved = term.MakeRaw(fd)?
+    write_raw(f"{ALT_SCREEN_ENTER}{CURSOR_HIDE}{CLEAR_HOME}")
+    Ok(Terminal { fd, saved })
+  }
+
+  /// Leave the alternate screen, show the cursor, and restore the saved
+  /// termios. Safe to call once on every exit path (clean quit and ctrl+c).
+  pub fn restore(self) {
+    write_raw(f"{CURSOR_SHOW}{ALT_SCREEN_LEAVE}")
+    let _ = term.Restore(self.fd, self.saved)
+  }
+
+  /// Current terminal dimensions. Falls back to a sane 80x24 if the ioctl
+  /// fails (e.g. output redirected), so the renderer always has a size.
+  pub fn size(self) -> Size {
+    match term.GetSize(self.fd) {
+      Ok((w, h)) => Size { width: w, height: h },
+      Err(_) => Size { width: 80, height: 24 },
+    }
+  }
+
+  /// Paint a whole frame: home the cursor, then a single write of the frame
+  /// string. No partial updates — the frame is the complete screen.
+  pub fn paint(self, frame: string) {
+    write_raw(f"{CURSOR_HOME}{frame}")
+  }
+}
+
+/// Write a raw string straight to stdout. Errors are ignored: a terminal that
+/// won't accept a frame is not something a redraw can recover from.
+fn write_raw(s: string) {
+  let _ = fmt.Fprint(os.Stdout, s)
+}
