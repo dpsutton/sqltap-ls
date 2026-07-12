@@ -15,8 +15,24 @@ version = "0.1.0"
 "golang.org/x/mod" = { version = "v0.27.0", via = ["golang.org/x/telemetry", "golang.org/x/tools"] }
 "golang.org/x/net" = { version = "v0.43.0", via = ["golang.org/x/crypto", "golang.org/x/tools"] }
 "golang.org/x/sync" = { version = "v0.17.0", via = ["github.com/jackc/puddle/v2", "golang.org/x/telemetry", "golang.org/x/tools"] }
-"golang.org/x/sys" = { version = "v0.47.0", via = ["golang.org/x/crypto", "golang.org/x/net", "golang.org/x/telemetry", "golang.org/x/term"] }
+"golang.org/x/sys" = { version = "v0.47.0", via = ["github.com/charmbracelet/x/term", "github.com/mattn/go-isatty", "github.com/muesli/cancelreader", "github.com/muesli/termenv", "golang.org/x/crypto", "golang.org/x/net", "golang.org/x/telemetry", "golang.org/x/term"] }
 "golang.org/x/telemetry" = { version = "v0.0.0-20250807160809-1a19826ec488", via = ["golang.org/x/tools"] }
 "golang.org/x/term" = "v0.45.0"
 "golang.org/x/text" = { version = "v0.29.0", via = ["github.com/jackc/pgx/v5", "golang.org/x/net"] }
 "golang.org/x/tools" = { version = "v0.36.0", via = ["golang.org/x/text"] }
+"github.com/charmbracelet/bubbletea" = "v1.3.10"
+"github.com/aymanbagabas/go-osc52/v2" = { version = "v2.0.1", via = ["github.com/muesli/termenv"] }
+"github.com/bits-and-blooms/bitset" = { version = "v1.22.0", via = ["github.com/charmbracelet/x/ansi"] }
+"github.com/charmbracelet/colorprofile" = { version = "v0.2.3-0.20250311203215-f60798e515dc", via = ["github.com/charmbracelet/x/cellbuf"] }
+"github.com/charmbracelet/lipgloss" = { version = "v1.1.0", via = ["github.com/charmbracelet/bubbletea"] }
+"github.com/charmbracelet/x/ansi" = { version = "v0.10.1", via = ["github.com/charmbracelet/bubbletea", "github.com/charmbracelet/colorprofile", "github.com/charmbracelet/lipgloss", "github.com/charmbracelet/x/cellbuf"] }
+"github.com/charmbracelet/x/cellbuf" = { version = "v0.0.13-0.20250311204145-2c3ea96c31dd", via = ["github.com/charmbracelet/lipgloss"] }
+"github.com/charmbracelet/x/term" = { version = "v0.2.1", via = ["github.com/charmbracelet/bubbletea", "github.com/charmbracelet/colorprofile", "github.com/charmbracelet/x/cellbuf"] }
+"github.com/lucasb-eyer/go-colorful" = { version = "v1.2.0", via = ["github.com/charmbracelet/colorprofile", "github.com/charmbracelet/x/ansi", "github.com/muesli/termenv"] }
+"github.com/mattn/go-isatty" = { version = "v0.0.20", via = ["github.com/muesli/termenv"] }
+"github.com/mattn/go-runewidth" = { version = "v0.0.16", via = ["github.com/charmbracelet/x/ansi", "github.com/charmbracelet/x/cellbuf", "github.com/muesli/ansi"] }
+"github.com/muesli/ansi" = { version = "v0.0.0-20230316100256-276c6243b2f6", via = ["github.com/charmbracelet/bubbletea"] }
+"github.com/muesli/cancelreader" = { version = "v0.2.2", via = ["github.com/charmbracelet/bubbletea"] }
+"github.com/muesli/termenv" = { version = "v0.16.0", via = ["github.com/charmbracelet/lipgloss"] }
+"github.com/rivo/uniseg" = { version = "v0.4.7", via = ["github.com/charmbracelet/lipgloss", "github.com/charmbracelet/x/ansi", "github.com/charmbracelet/x/cellbuf", "github.com/mattn/go-runewidth", "github.com/muesli/termenv"] }
+"github.com/xo/terminfo" = { version = "v0.0.0-20220910002029-abceb7e1c41e", via = ["github.com/charmbracelet/colorprofile"] }

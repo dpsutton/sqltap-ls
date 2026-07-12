@@ -3,41 +3,30 @@ import "go:os"
 import "go:os/signal"
 import "go:syscall"
 import "go:time"
-import "go:fmt"
 import "event"
 
 /// Manual live check: `lis build` then `./target/bin/sqltap-ls` *if* main.lis
-/// is temporarily pointed here (revert before committing). Enters raw mode,
-/// feeds fake traffic at ~20 events/s, and drives the real actor loop so you
-/// can navigate with j/k/arrows, toggle tx with space, pause with p, inspect
-/// with enter, and quit with q or ctrl+c.
-///
-/// Wiring `sqltap watch` (real `client.watch` receiver in place of the fake
-/// feed) comes later; the loop signature already takes the events channel.
+/// is temporarily pointed here (revert before committing). Runs the real Bubble
+/// Tea program against a fake ~20 events/s feed so you can navigate with
+/// j/k/arrows, toggle tx with space, pause with p, inspect with enter, explain
+/// with x/X, edit with e/E, and quit with q or ctrl+c — the same runtime the
+/// live `watch` uses, just with a synthetic event source.
 #[allow(lost_cancel)]
 pub fn demo() {
-  // SIGINT/SIGTERM cancel the context; the loop's ctx.Done() arm restores the
-  // terminal. Drop the CancelFunc: this is a process-lifetime signal context.
+  // SIGINT/SIGTERM cancel the context; Bubble Tea also handles ctrl+c itself.
   let (ctx, _) = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 
-  let term = match Terminal.enter() {
-    Ok(t) => t,
-    Err(e) => {
-      let _ = fmt.Fprintln(os.Stderr, f"sql-tap: cannot enter raw mode: {e}")
-      return
-    },
-  }
-
   let events = Channel.buffered<event.Event>(64)
-  let keys = Channel.new<Key>()
-
-  // Reader task: raw stdin bytes -> decoded Keys. Reads os.Stdin directly.
-  task read_keys(keys)
-
-  // Fake traffic generator, cancelled with the context.
   task feed_fake_events(ctx, events)
 
-  run(ctx, "localhost:9091", events, keys, term)
+  if let Err(e) = run(ctx, "localhost:9091", events) {
+    let _ = fmt_fprintln_stderr(f"sql-tap: {e}")
+  }
+}
+
+fn fmt_fprintln_stderr(s: string) -> Result<(), error> {
+  let _ = os.Stderr.WriteString(s + "\n")
+  Ok(())
 }
 
 /// Emit a repeating cycle of synthetic events (a couple of standalone queries

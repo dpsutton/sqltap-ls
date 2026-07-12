@@ -1,20 +1,17 @@
 import "go:context"
 import "go:os"
-import "go:os/exec"
 import "go:os/signal"
 import "go:syscall"
 import "go:strings"
-import "go:time"
 import "go:fmt"
-import "go:golang.org/x/term"
-import "event"
 import "client"
-import "clipboard"
 
 /// Live entry point for `sqltap watch <addr>`. Sets up a signal-cancelled
-/// context, opens the daemon SSE stream, enters raw mode, and runs the actor
-/// loop. A connection failure prints a friendly message and returns without
-/// entering the alternate screen (nothing to restore).
+/// context, opens the daemon SSE stream, and runs the Bubble Tea program on the
+/// alternate screen. A connection failure prints a friendly message and returns
+/// without entering the alternate screen (nothing to restore). The Bubble Tea
+/// program itself is built and driven in tea_shim.lis (`run`), the only file
+/// that touches the bubbletea package.
 #[allow(lost_cancel)]
 pub fn watch(addr: string) -> Result<(), error> {
   let (ctx, _) = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -27,12 +24,7 @@ pub fn watch(addr: string) -> Result<(), error> {
     },
   }
 
-  let term = Terminal.enter()?
-  let keys = Channel.new<Key>()
-  task read_keys(keys)
-
-  run(ctx, addr, events, keys, term)
-  Ok(())
+  run(ctx, addr, events)
 }
 
 /// Turn a connection error into a helpful message, mirroring Go's friendlyError.
@@ -45,212 +37,16 @@ pub fn friendly_error(e: error) -> string {
   }
 }
 
-/// The actor event loop. A single fan-in inbox merges every input — traffic
-/// events, keys, resize signals, and effect results — into one `Channel<Msg>`,
-/// and the loop selects that inbox against cancellation. `update` is pure and
-/// returns an `Effect`; the loop executes the effect (spawning a task where the
-/// effect is IO) so the transition stays testable. `term` is the only terminal
-/// writer; the key-decoder task is the only reader.
-pub fn run(
-  ctx: context.Context,
-  addr: string,
-  events: Channel<event.Event>,
-  keys: Channel<Key>,
-  mut term: Terminal,
-) {
-  defer term.restore()
+// --- editor helpers (used by tea_shim's editor_cmd) ------------------------
 
-  let inbox = Channel.buffered<Msg>(128)
-  let resizes = Channel.buffered<Msg>(8)
-  spawn_resize_watcher(ctx, resizes)
-  task fan_in(events, keys, resizes, inbox)
-
-  let mut model = Model.new()
-  let size = term.size()
-  model = Model { width: size.width, height: size.height, ..model }
-  paint(term, model)
-
-  loop {
-    select {
-      let _ = ctx.Done().receive() => { return },
-      let Some(msg) = inbox.receive() => {
-        let (next_model, effect) = update(model, msg)
-        model = Model { ..next_model }
-        match run_effect(ctx, addr, effect, &term, inbox) {
-          EffectOutcome.Continue => paint(term, model),
-          EffectOutcome.Quit => { return },
-        }
-      },
-    }
-  }
-}
-
-// Whether the loop should keep running after an effect.
-enum EffectOutcome {
-  Continue,
-  Quit,
-}
-
-// Execute the effect an update produced. IO-bearing effects spawn a task that
-// posts a result Msg back to the inbox; the editor effect runs inline because
-// it must suspend/resume the terminal from the loop.
-fn run_effect(
-  ctx: context.Context,
-  addr: string,
-  effect: Effect,
-  term: Ref<Terminal>,
-  inbox: Channel<Msg>,
-) -> EffectOutcome {
-  match effect {
-    Effect.Nothing => EffectOutcome.Continue,
-    Effect.Quit => EffectOutcome.Quit,
-    Effect.RunExplain { kind, query, args } => {
-      spawn_explain(ctx, addr, kind, query, args, inbox)
-      EffectOutcome.Continue
-    },
-    Effect.RunExport { format, events, filter, search } => {
-      spawn_export(format, events, filter, search, inbox)
-      EffectOutcome.Continue
-    },
-    Effect.CopyText { text } => {
-      spawn_copy(ctx, text)
-      EffectOutcome.Continue
-    },
-    Effect.Alert { seq } => {
-      spawn_alert_timer(seq, inbox)
-      EffectOutcome.Continue
-    },
-    Effect.OpenEditor { kind, query, args } => {
-      run_editor(ctx, kind, query, args, term, inbox)
-      EffectOutcome.Continue
-    },
-  }
-}
-
-// --- effect tasks --------------------------------------------------------
-
-fn spawn_explain(
-  ctx: context.Context,
-  addr: string,
-  kind: ExplainKind,
-  query: string,
-  args: Slice<string>,
-  inbox: Channel<Msg>,
-) {
-  task {
-    let msg = match client.explain(ctx, addr, query, args, kind.analyze()) {
-      Ok(plan) => Msg.ExplainResult { plan: Some(plan), error: None },
-      Err(e) => Msg.ExplainResult { plan: None, error: Some(f"{e}") },
-    }
-    let _ = inbox.send(msg)
-  }
-}
-
-fn spawn_export(
-  format: ExportFormat,
-  events: Slice<event.Event>,
-  filter: string,
-  search: string,
-  inbox: Channel<Msg>,
-) {
-  task {
-    let now = time.Now()
-    let msg = match write_export(events, filter, search, format, "", now) {
-      Ok(path) => Msg.ExportResult { path: Some(path), error: None },
-      Err(e) => Msg.ExportResult { path: None, error: Some(f"{e}") },
-    }
-    let _ = inbox.send(msg)
-  }
-}
-
-fn spawn_copy(ctx: context.Context, text: string) {
-  task {
-    let _ = clipboard.copy(ctx, text)
-  }
-}
-
-fn spawn_alert_timer(seq: int, inbox: Channel<Msg>) {
-  task {
-    time.Sleep(alert_duration())
-    let _ = inbox.send(Msg.ClearAlert { seq })
-  }
-}
-
-// Run the external editor: suspend the TUI, launch $EDITOR on a temp .sql file,
-// resume, then post an EditorResult with the stripped query.
-fn run_editor(
-  ctx: context.Context,
-  kind: ExplainKind,
-  query: string,
-  args: Slice<string>,
-  term: Ref<Terminal>,
-  inbox: Channel<Msg>,
-) {
-  let result = edit_query(ctx, kind, query, args, term)
-  let _ = inbox.send(result)
-}
-
-fn edit_query(
-  ctx: context.Context,
-  kind: ExplainKind,
-  query: string,
-  args: Slice<string>,
-  term: Ref<Terminal>,
-) -> Msg {
-  let file = match os.CreateTemp("", "sql-tap-*.sql") {
-    Ok(f) => f,
-    Err(e) => { return editor_error(kind, e) },
-  }
-  let path = file.Name()
-  let header = editor_header(kind)
-  if let Partial.Err(e) = file.WriteString(header + query) {
-    let _ = file.Close()
-    let _ = os.Remove(path)
-    return editor_error(kind, e)
-  }
-  let _ = file.Close()
-
-  let editor = editor_command()
-
-  // Suspend the TUI so the editor owns a cooked terminal.
-  let _ = term.suspend()
-  let mut cmd = exec.CommandContext(ctx, editor, path)
-  cmd.Stdin = Some(os.Stdin)
-  cmd.Stdout = Some(os.Stdout)
-  cmd.Stderr = Some(os.Stderr)
-  let run_err = cmd.Run()
-  let _ = term.resume()
-
-  defer os.Remove(path)
-
-  match run_err {
-    Err(e) => editor_error(kind, e),
-    Ok(_) => {
-      match os.ReadFile(path) {
-        Ok(bytes) => {
-          let edited = strip_comments(bytes as string)
-          if edited == "" {
-            Msg.EditorResult { query: None, args, kind, error: None }
-          } else {
-            Msg.EditorResult { query: Some(edited), args, kind, error: None }
-          }
-        },
-        Err(e) => editor_error(kind, e),
-      }
-    },
-  }
-}
-
-fn editor_error(kind: ExplainKind, e: error) -> Msg {
-  Msg.EditorResult { query: None, args: [], kind, error: Some(f"{e}") }
-}
-
-fn editor_header(kind: ExplainKind) -> string {
+/// The comment header prepended to the temp .sql file the editor opens.
+pub fn editor_header(kind: ExplainKind) -> string {
   let title = kind.title()
   f"-- Edit this query, then save and quit to run {title}.\n-- To cancel, clear the file or quit without saving.\n-- Lines starting with -- are stripped before execution.\n\n"
 }
 
-fn editor_command() -> string {
+/// $EDITOR, falling back to vi.
+pub fn editor_command() -> string {
   let e = os.Getenv("EDITOR")
   if e == "" { "vi" } else { e }
 }
@@ -267,60 +63,4 @@ pub fn strip_comments(s: string) -> string {
     }
   }
   strings.TrimSpace(strings.Join(out, "\n"))
-}
-
-// --- fan-in and terminal glue --------------------------------------------
-
-/// Forward every input source onto the single Msg inbox. Ends when the event or
-/// key stream closes (shutdown closes stdin, which closes the key stream).
-fn fan_in(
-  events: Channel<event.Event>,
-  keys: Channel<Key>,
-  resizes: Channel<Msg>,
-  inbox: Channel<Msg>,
-) {
-  task {
-    for ev in events {
-      let _ = inbox.send(Msg.Incoming(ev))
-    }
-  }
-  task {
-    for msg in resizes {
-      let _ = inbox.send(msg)
-    }
-  }
-  for key in keys {
-    let _ = inbox.send(Msg.Press(key))
-  }
-}
-
-// Watch for SIGWINCH and post a Resized msg with the re-queried terminal size.
-fn spawn_resize_watcher(ctx: context.Context, resizes: Channel<Msg>) {
-  let sig = Channel.buffered<os.Signal>(1)
-  let (sender, receiver) = sig.split()
-  signal.Notify(sender, syscall.SIGWINCH)
-  task {
-    loop {
-      select {
-        let _ = ctx.Done().receive() => { return },
-        let Some(_) = receiver.receive() => {
-          let size = current_size()
-          let _ = resizes.send(Msg.Resized { width: size.width, height: size.height })
-        },
-      }
-    }
-  }
-}
-
-// Query the current terminal size directly (the watcher has no Terminal handle).
-fn current_size() -> Size {
-  let fd = os.Stdin.Fd() as int
-  match term.GetSize(fd) {
-    Ok((w, h)) => Size { width: w, height: h },
-    Err(_) => Size { width: 80, height: 24 },
-  }
-}
-
-fn paint(term: Terminal, model: Model) {
-  term.paint(view(model, model.width, model.height))
 }

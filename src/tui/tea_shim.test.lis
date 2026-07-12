@@ -1,0 +1,135 @@
+import tea "go:github.com/charmbracelet/bubbletea"
+import "go:context"
+import "go:bytes"
+import "go:strings"
+import "go:time"
+import "event"
+
+// ============================================================================
+// Shim tests: the interop layer only. The pure core has its own suites; here we
+// prove the three translations the adapter performs — tea.KeyMsg -> Key,
+// Effect -> Cmd (Some/None), and a real headless Bubble Tea program driving the
+// adapter end-to-end and self-quitting.
+// ============================================================================
+
+// A KeyMsg for a single printable rune (Go: Key{Type: KeyRunes, Runes: [r]}).
+fn rune_key(r: rune) -> tea.KeyMsg {
+  tea.KeyMsg { Type: tea.KeyRunes, Runes: [r], Alt: false, Paste: false }
+}
+
+// A KeyMsg for a named/typed key (enter, esc, arrows, ctrl chords).
+fn typed_key(t: tea.KeyType) -> tea.KeyMsg {
+  tea.KeyMsg { Type: t, Runes: [], Alt: false, Paste: false }
+}
+
+/// The mapping goes through tea.KeyMsg.String(), the same strings Go switches
+/// on. Construct real KeyMsg values and confirm String() -> decode_key yields
+/// the core Key the update function matches on.
+#[test("tui: decode_key maps real KeyMsg String() forms to the Key enum")]
+fn test_decode_key_from_keymsg() {
+  let assert Some(Key.Char('j')) = decode_key(rune_key('j').String())
+  let assert Some(Key.Char('X')) = decode_key(rune_key('X').String())
+  let assert Some(Key.Enter) = decode_key(typed_key(tea.KeyEnter).String())
+  let assert Some(Key.Esc) = decode_key(typed_key(tea.KeyEscape).String())
+  let assert Some(Key.Space) = decode_key(typed_key(tea.KeySpace).String())
+  let assert Some(Key.Up) = decode_key(typed_key(tea.KeyUp).String())
+  let assert Some(Key.Down) = decode_key(typed_key(tea.KeyDown).String())
+  let assert Some(Key.Left) = decode_key(typed_key(tea.KeyLeft).String())
+  let assert Some(Key.PgUp) = decode_key(typed_key(tea.KeyPgUp).String())
+  let assert Some(Key.CtrlC) = decode_key(typed_key(tea.KeyCtrlC).String())
+  let assert Some(Key.Backspace) = decode_key(typed_key(tea.KeyBackspace).String())
+  let assert Some(Key.Tab) = decode_key(typed_key(tea.KeyTab).String())
+}
+
+/// The literal String() forms Go's Bubble Tea produces, mapped directly. Guards
+/// the mapping table independently of KeyType constants.
+#[test("tui: decode_key covers the Bubble Tea key-string vocabulary")]
+fn test_decode_key_strings() {
+  let assert Some(Key.CtrlD) = decode_key("ctrl+d")
+  let assert Some(Key.CtrlU) = decode_key("ctrl+u")
+  let assert Some(Key.CtrlL) = decode_key("ctrl+l")
+  let assert Some(Key.PgDown) = decode_key("pgdown")
+  let assert Some(Key.Home) = decode_key("home")
+  let assert Some(Key.End) = decode_key("end")
+  let assert Some(Key.Right) = decode_key("right")
+  // Unmapped chords the model has no variant for drop.
+  let assert None = decode_key("ctrl+z")
+  let assert None = decode_key("shift+tab")
+}
+
+// Build an adapter with a throwaway context/addr for run_effect probing.
+fn probe_adapter() -> Adapter {
+  Adapter.new(Channel.new<event.Event>(), context.Background(), "localhost:9091")
+}
+
+/// run_effect returns None for the two no-Cmd effects and Some for every IO
+/// effect and for Quit.
+#[test("tui: run_effect returns Some/None per Effect variant")]
+fn test_run_effect_variants() {
+  let a = probe_adapter()
+  let assert None = a.run_effect(Effect.Nothing)
+  let assert Some(_) = a.run_effect(Effect.Quit)
+  let assert Some(_) = a.run_effect(Effect.RunExplain { kind: ExplainKind.Explain, query: "SELECT 1", args: [] })
+  let assert Some(_) = a.run_effect(Effect.OpenEditor { kind: ExplainKind.Analyze, query: "SELECT 1", args: [] })
+  let assert Some(_) = a.run_effect(Effect.RunExport { format: ExportFormat.Json, events: [], filter: "", search: "" })
+  let assert Some(_) = a.run_effect(Effect.CopyText { text: "hi" })
+  let assert Some(_) = a.run_effect(Effect.Alert { seq: 1 })
+}
+
+// A message type the adapter has never heard of, to prove decode drops it.
+struct ForeignMsg {}
+
+/// The adapter's decode is total over the message types it cares about: a real
+/// WindowSizeMsg becomes Msg.Resized, and a fabricated foreign msg is ignored.
+#[test("tui: decode maps WindowSizeMsg to Resized and ignores unknown msgs")]
+fn test_decode_msg() {
+  let a = probe_adapter()
+  let assert Some(Msg.Resized { width: 120, height: 40 }) =
+    a.decode(tea.WindowSizeMsg { Width: 120, Height: 40 })
+  // A struct the adapter doesn't recognize decodes to None (ignored).
+  let assert None = a.decode(foreign_msg())
+}
+
+// Widen a ForeignMsg to tea.Msg (Unknown) by routing it through a Cmd, since a
+// direct `as Unknown` is a compile error.
+fn foreign_msg() -> tea.Msg {
+  let cmd: tea.Cmd = || ForeignMsg {}
+  cmd()
+}
+
+/// End-to-end headless smoke, modeled on the spike: a real tea.Program with an
+/// empty input reader and no renderer, fed events through the recv Cmd chain via
+/// a channel, then a 'q' keypress that self-quits. Run() returns the final model
+/// (the interface); assert its View reflects the ingested events.
+#[test("tui: headless program ingests events via the recv Cmd and self-quits")]
+fn test_headless_end_to_end() {
+  let events = Channel.buffered<event.Event>(8)
+  let adapter = Adapter.new(events, context.Background(), "localhost:9091")
+
+  let empty = bytes.NewReader([])
+  let prog = tea.NewProgram(adapter, tea.WithInput(empty), tea.WithoutRenderer())
+
+  // Feed three events over the channel (delivered by the recv Cmd chain), give
+  // the runtime a moment to process them, then quit via a real KeyMsg.
+  task {
+    let samples = sample_events()
+    let _ = events.send(samples[0])
+    let _ = events.send(samples[1])
+    let _ = events.send(samples[6]) // the slow query
+    time.Sleep(50 * time.Millisecond)
+    prog.Send(rune_key('q'))
+  }
+
+  match prog.Run() {
+    Ok(final) => {
+      let out = final.View()
+      // Three events ingested: the list title counts them.
+      assert strings.Contains(out, "sql-tap (3 queries)")
+      // The slow query's SLOW glyph is rendered.
+      assert strings.Contains(out, "SLOW")
+    },
+    Err(e) => {
+      assert f"{e}" == ""
+    },
+  }
+}

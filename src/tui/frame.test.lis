@@ -257,20 +257,3 @@ fn test_stripper_agreement() {
   assert vis_width(styled) == visible_len(styled)
   assert vis_width(styled) == 11
 }
-
-// --- painter frame hygiene -------------------------------------------------
-
-#[test("compose_frame homes, erases each line, joins with CRLF, erases below")]
-fn test_compose_frame_hygiene() {
-  let out = compose_frame("aa\nbbb")
-  // Homes the cursor, never a full-screen 2J erase (that would flicker).
-  assert strings.HasPrefix(out, "\x1b[H")
-  assert !strings.Contains(out, "\x1b[2J")
-  // Each line is followed by erase-to-end-of-line so residue is overwritten.
-  assert strings.Contains(out, f"aa{ERASE_LINE}")
-  assert strings.Contains(out, f"bbb{ERASE_LINE}")
-  // Lines carry an explicit CR (raw mode has no implicit carriage return).
-  assert strings.Contains(out, "\r\n")
-  // Ends with erase-below so a shrunk frame leaves no stale trailing rows.
-  assert strings.HasSuffix(out, ERASE_BELOW)
-}

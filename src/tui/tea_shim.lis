@@ -1,0 +1,362 @@
+import tea "go:github.com/charmbracelet/bubbletea"
+import "go:context"
+import "go:os"
+import "go:os/exec"
+import "go:time"
+import "event"
+import "client"
+import "clipboard"
+
+// ============================================================================
+// The ONE gross adapter file. Every scrap of Bubble Tea interop lives here —
+// `assert_type` casts, `as tea.Model` coercions, `tea.Cmd` closures, the
+// carrier structs that widen to `tea.Msg` (Unknown). No other file imports the
+// bubbletea package. The rest of src/tui stays a pure typed core: Model, the
+// Msg/Effect enums, `update`, `view`.
+//
+// The shape mirrors the old actor loop exactly, just driven by Bubble Tea:
+//   Update = decode(tea.Msg) -> core update(Model, Msg) -> run_effect(Effect)
+// and every Update re-issues the event-receive Cmd, the way the Go original
+// chained recvEvent after each delivery.
+// ============================================================================
+
+/// The adapter: the pure `Model` plus the live wiring an `Effect` needs to run
+/// (the traffic channel to receive from, and the ctx/addr the explain/copy/
+/// editor effects reach the daemon through). Bubble Tea threads this value
+/// through Update; the pure Model rides inside it.
+pub struct Adapter {
+  model: Model,
+  events: Channel<event.Event>,
+  ctx: context.Context,
+  addr: string,
+}
+
+impl Adapter {
+  /// Build an adapter around a fresh Model bound to `events` as its feed.
+  pub fn new(events: Channel<event.Event>, ctx: context.Context, addr: string) -> Adapter {
+    Adapter { model: Model.new(), events, ctx, addr }
+  }
+}
+
+/// Construct the adapter and run a real Bubble Tea program with the alternate
+/// screen. Bubble Tea owns raw mode, key decoding, WindowSizeMsg on resize, and
+/// alt-screen painting; this adapter is the only interop surface. Blocks until
+/// the user quits. Lives here so run.lis and demo.lis never import bubbletea.
+pub fn run(ctx: context.Context, addr: string, events: Channel<event.Event>) -> Result<(), error> {
+  let adapter = Adapter.new(events, ctx, addr)
+  let prog = tea.NewProgram(adapter, tea.WithAltScreen())
+  let _final = prog.Run()?
+  Ok(())
+}
+
+// --- carrier messages ------------------------------------------------------
+// Effect results and channel deliveries come back as these structs, widened to
+// tea.Msg (Unknown) IMPLICITLY when a Cmd closure returns them. `decode` narrows
+// each back into a core `Msg` variant.
+
+/// One captured event, delivered by the event-receive Cmd.
+struct EventArrived {
+  ev: event.Event,
+}
+
+/// The traffic channel closed; stop re-subscribing.
+struct SourceClosed {}
+
+/// An EXPLAIN result posted back from the explain Cmd.
+struct ExplainDone {
+  plan: Option<string>,
+  error: Option<string>,
+}
+
+/// An $EDITOR round-trip result posted back from the ExecProcess callback.
+struct EditorDone {
+  query: Option<string>,
+  args: Slice<string>,
+  kind: ExplainKind,
+  error: Option<string>,
+}
+
+/// An export-to-disk result posted back from the export Cmd.
+struct ExportDone {
+  path: Option<string>,
+  error: Option<string>,
+}
+
+/// The alert-expiry tick, carrying the alert sequence it should clear.
+struct ClearAlertTick {
+  seq: int,
+}
+
+// --- tea.Model interface (structural) --------------------------------------
+
+impl Adapter {
+  /// Init kicks off the first event-receive Cmd — the model starts pulling
+  /// traffic immediately, exactly like the Go original's connect+recvEvent.
+  fn Init(self) -> Option<tea.Cmd> {
+    Some(recv_event(self.events))
+  }
+
+  /// The crux. Decode the erased tea.Msg into a core `Msg`, run the pure
+  /// `update` to get the next Model + Effect, translate the Effect into a
+  /// tea.Cmd, and — for every delivered traffic event — re-issue the receive
+  /// Cmd so the stream keeps flowing. Return type is the INTERFACE `tea.Model`;
+  /// every return coerces `next as tea.Model`.
+  fn Update(self, msg: tea.Msg) -> (tea.Model, Option<tea.Cmd>) {
+    let Some(core_msg) = self.decode(msg) else {
+      return (self as tea.Model, None)
+    }
+    let (next_model, effect) = update(self.model, core_msg)
+    let next = Adapter { model: next_model, events: self.events, ctx: self.ctx, addr: self.addr }
+    let effect_cmd = next.run_effect(effect)
+    // A delivered event (or a source-close) drives the recv chain onward.
+    let resub = self.resubscribe_cmd(core_msg)
+    let cmd = batch2(effect_cmd, resub)
+    (next as tea.Model, cmd)
+  }
+
+  fn View(self) -> string {
+    view(self.model, self.model.width, self.model.height)
+  }
+}
+
+impl Adapter {
+  // Re-issue the event-receive Cmd after a real traffic delivery, so the stream
+  // keeps pulling. A source-close or any other message does not re-subscribe.
+  fn resubscribe_cmd(self, core_msg: Msg) -> Option<tea.Cmd> {
+    match core_msg {
+      Msg.Incoming(_) => Some(recv_event(self.events)),
+      _ => None,
+    }
+  }
+
+  // --- decode: tea.Msg (Unknown) -> core Msg -----------------------------
+
+  /// Narrow an erased tea.Msg into a core `Msg`, or None to ignore it. This is
+  /// the type-switch: chained `if let Some(x) = assert_type<T>(msg)`.
+  fn decode(self, msg: tea.Msg) -> Option<Msg> {
+    if let Some(k) = assert_type<tea.KeyMsg>(msg) {
+      return decode_key(k.String()).map(Msg.Press)
+    }
+    if let Some(ws) = assert_type<tea.WindowSizeMsg>(msg) {
+      return Some(Msg.Resized { width: ws.Width, height: ws.Height })
+    }
+    if let Some(ea) = assert_type<EventArrived>(msg) {
+      return Some(Msg.Incoming(ea.ev))
+    }
+    if let Some(_closed) = assert_type<SourceClosed>(msg) {
+      return None
+    }
+    if let Some(ed) = assert_type<ExplainDone>(msg) {
+      return Some(Msg.ExplainResult { plan: ed.plan, error: ed.error })
+    }
+    if let Some(ed) = assert_type<EditorDone>(msg) {
+      return Some(Msg.EditorResult { query: ed.query, args: ed.args, kind: ed.kind, error: ed.error })
+    }
+    if let Some(xd) = assert_type<ExportDone>(msg) {
+      return Some(Msg.ExportResult { path: xd.path, error: xd.error })
+    }
+    if let Some(ct) = assert_type<ClearAlertTick>(msg) {
+      return Some(Msg.ClearAlert { seq: ct.seq })
+    }
+    None
+  }
+
+  // --- run_effect: core Effect -> tea.Cmd --------------------------------
+
+  /// Translate a pure `Effect` into a tea.Cmd (or None for Effect.Nothing).
+  /// Quit self-quits deterministically (the FIFO queue guarantees prior msgs
+  /// applied); IO effects return a Cmd Bubble Tea runs on its own goroutine.
+  fn run_effect(self, effect: Effect) -> Option<tea.Cmd> {
+    match effect {
+      Effect.Nothing => None,
+      Effect.Quit => Some(tea.Quit),
+      Effect.RunExplain { kind, query, args } =>
+        Some(explain_cmd(self.ctx, self.addr, kind, query, args)),
+      Effect.OpenEditor { kind, query, args } =>
+        Some(editor_cmd(self.ctx, kind, query, args)),
+      Effect.RunExport { format, events, filter, search } =>
+        Some(export_cmd(format, events, filter, search)),
+      Effect.CopyText { text } => Some(copy_cmd(self.ctx, text)),
+      Effect.Alert { seq } => Some(alert_tick_cmd(seq)),
+    }
+  }
+}
+
+// --- Cmd constructors ------------------------------------------------------
+// Each is a closure satisfying tea.Cmd = fn() -> Unknown. The returned struct
+// widens to tea.Msg implicitly — writing `as tea.Msg` here would be an error.
+
+/// A Cmd that blocks on the traffic channel and yields the next event as an
+/// EventArrived (or SourceClosed on close). Bubble Tea runs Cmds on their own
+/// goroutines, so this blocking receive is the intended recvEvent idiom.
+#[allow(manual_map_or)]
+fn recv_event(events: Channel<event.Event>) -> tea.Cmd {
+  // The two arms are DIFFERENT structs that each widen to tea.Msg (Unknown)
+  // independently — a map_or_else would try to unify them into one type and
+  // fail, so the match stays.
+  || {
+    match events.receive() {
+      Some(ev) => EventArrived { ev },
+      None => SourceClosed {},
+    }
+  }
+}
+
+/// A Cmd that runs an EXPLAIN against the daemon and posts the result.
+fn explain_cmd(
+  ctx: context.Context,
+  addr: string,
+  kind: ExplainKind,
+  query: string,
+  args: Slice<string>,
+) -> tea.Cmd {
+  || {
+    match client.explain(ctx, addr, query, args, kind.analyze()) {
+      Ok(plan) => ExplainDone { plan: Some(plan), error: None },
+      Err(e) => ExplainDone { plan: None, error: Some(f"{e}") },
+    }
+  }
+}
+
+/// A Cmd that writes the export to disk and posts the resulting path or error.
+fn export_cmd(
+  format: ExportFormat,
+  events: Slice<event.Event>,
+  filter: string,
+  search: string,
+) -> tea.Cmd {
+  || {
+    let now = time.Now()
+    match write_export(events, filter, search, format, "", now) {
+      Ok(path) => ExportDone { path: Some(path), error: None },
+      Err(e) => ExportDone { path: None, error: Some(f"{e}") },
+    }
+  }
+}
+
+/// A Cmd that copies `text` to the clipboard. Copy has no user-visible result
+/// message (the "copied!" alert is set synchronously in `update`), so it posts
+/// an already-expired ClearAlertTick with a sentinel seq that clears nothing.
+fn copy_cmd(ctx: context.Context, text: string) -> tea.Cmd {
+  || {
+    let _ = clipboard.copy(ctx, text)
+    ClearAlertTick { seq: -1 }
+  }
+}
+
+/// A Cmd that sleeps for the alert lifetime, then posts a ClearAlertTick for
+/// `seq` — the pure `on_clear_alert` ignores it unless `seq` is still current.
+fn alert_tick_cmd(seq: int) -> tea.Cmd {
+  || {
+    time.Sleep(alert_duration())
+    ClearAlertTick { seq }
+  }
+}
+
+/// A Cmd for the $EDITOR flow. `tea.ExecProcess` suspends the program, runs the
+/// editor on the tty, resumes, then fires the callback with the run error; the
+/// callback reads the edited file back and posts an EditorDone. The temp-file
+/// dance that used to sit in run.lis lives here now.
+fn editor_cmd(
+  ctx: context.Context,
+  kind: ExplainKind,
+  query: string,
+  args: Slice<string>,
+) -> tea.Cmd {
+  let file = match os.CreateTemp("", "sql-tap-*.sql") {
+    Ok(f) => f,
+    Err(e) => { return editor_error_cmd(kind, f"{e}") },
+  }
+  let path = file.Name()
+  let header = editor_header(kind)
+  if let Partial.Err(e) = file.WriteString(header + query) {
+    let _ = file.Close()
+    let _ = os.Remove(path)
+    return editor_error_cmd(kind, f"{e}")
+  }
+  let _ = file.Close()
+
+  let editor = editor_command()
+  let cmd = exec.CommandContext(ctx, editor, path)
+  tea.ExecProcess(cmd, |run_err| editor_result(kind, args, path, run_err))
+}
+
+// Build the EditorDone from the editor's exit: strip comments from the file, or
+// carry the run error. Always removes the temp file afterward. Bubble Tea's
+// ExecCallback hands us a bare `error` that is nil on success; a nil interface
+// formats as "<nil>", which is how we tell success from failure here.
+fn editor_result(kind: ExplainKind, args: Slice<string>, path: string, run_err: error) -> tea.Msg {
+  defer os.Remove(path)
+  let err_text = f"{run_err}"
+  if err_text != "<nil>" {
+    return EditorDone { query: None, args: [], kind, error: Some(err_text) }
+  }
+  match os.ReadFile(path) {
+    Ok(bytes) => {
+      let edited = strip_comments(bytes as string)
+      if edited == "" {
+        EditorDone { query: None, args, kind, error: None }
+      } else {
+        EditorDone { query: Some(edited), args, kind, error: None }
+      }
+    },
+    Err(e) => EditorDone { query: None, args: [], kind, error: Some(f"{e}") },
+  }
+}
+
+// A Cmd that immediately posts an editor error (temp-file setup failed, before
+// any process ran).
+fn editor_error_cmd(kind: ExplainKind, message: string) -> tea.Cmd {
+  || EditorDone { query: None, args: [], kind, error: Some(message) }
+}
+
+// Combine two optional Cmds into one. Bubble Tea's Batch takes varargs and
+// returns Option<Cmd>; None inputs drop out.
+fn batch2(a: Option<tea.Cmd>, b: Option<tea.Cmd>) -> Option<tea.Cmd> {
+  match (a, b) {
+    (Some(x), Some(y)) => tea.Batch(x, y),
+    (Some(x), None) => Some(x),
+    (None, Some(y)) => Some(y),
+    (None, None) => None,
+  }
+}
+
+// --- key mapping -----------------------------------------------------------
+
+/// Map a `tea.KeyMsg.String()` form into the core `Key` enum, or None to drop
+/// keys the model has no variant for. These are the same strings Go's Bubble
+/// Tea switches on: "j", "ctrl+c", "enter", "esc", " ", "up"/"down"/"left"/
+/// "right", "pgup"/"pgdown", "home"/"end", "backspace", "tab".
+pub fn decode_key(s: string) -> Option<Key> {
+  match s {
+    "up" => Some(Key.Up),
+    "down" => Some(Key.Down),
+    "left" => Some(Key.Left),
+    "right" => Some(Key.Right),
+    "pgup" => Some(Key.PgUp),
+    "pgdown" => Some(Key.PgDown),
+    "home" => Some(Key.Home),
+    "end" => Some(Key.End),
+    "enter" => Some(Key.Enter),
+    "backspace" => Some(Key.Backspace),
+    "tab" => Some(Key.Tab),
+    "esc" => Some(Key.Esc),
+    " " => Some(Key.Space),
+    "ctrl+c" => Some(Key.CtrlC),
+    "ctrl+d" => Some(Key.CtrlD),
+    "ctrl+u" => Some(Key.CtrlU),
+    "ctrl+l" => Some(Key.CtrlL),
+    _ => decode_key_char(s),
+  }
+}
+
+// A single-rune key string becomes Char(rune); anything else (a chord or named
+// key the model ignores) drops.
+fn decode_key_char(s: string) -> Option<Key> {
+  let runes = s.runes()
+  if runes.length() == 1 {
+    Some(Key.Char(runes[0]))
+  } else {
+    None
+  }
+}
