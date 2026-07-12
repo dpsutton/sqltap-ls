@@ -70,10 +70,7 @@ impl Detector {
 
     // At or above threshold: always matched, but only alert when there is no
     // prior alert for this template or the cooldown has elapsed.
-    let should_alert = match self.last_alert.get(query) {
-      None => true,
-      Some(last) => t.Sub(last) >= self.cooldown,
-    }
+    let should_alert = self.last_alert.get(query).map_or(true, |last| t.Sub(last) >= self.cooldown)
 
     if should_alert {
       self.last_alert[query] = t

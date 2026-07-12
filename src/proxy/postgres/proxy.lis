@@ -72,11 +72,8 @@ fn serve_conn(
   }
 
   let mut c = Conn.new(client_conn, upstream_conn, events)
-  match run_connection(&c) {
-    Ok(_) => {},
-    Err(e) => {
-      log.Printf("postgres: relay %s: %v", client_conn.RemoteAddr(), e)
-    },
+  if let Err(e) = run_connection(&c) {
+    log.Printf("postgres: relay %s: %v", client_conn.RemoteAddr(), e)
   }
 
   let _ = client_conn.Close()

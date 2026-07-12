@@ -62,19 +62,16 @@ pub struct Config {
 impl Config {
   /// The default configuration, matching the Go `config.Default()`.
   pub fn default() -> Config {
-    Config { 
-      driver: None,
-      listen: "",
-      upstream: "",
+    Config {
       api_addr: ":9091",
-      http: "",
       dsn_env: "DATABASE_URL",
       slow_threshold: (100 as time.Duration) * time.Millisecond,
-      nplus1: Nplus1Config { 
+      nplus1: Nplus1Config {
         threshold: 5,
         window: (1 as time.Duration) * time.Second,
         cooldown: (10 as time.Duration) * time.Second,
       },
+      ..
     }
   }
 }

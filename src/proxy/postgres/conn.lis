@@ -64,15 +64,12 @@ impl Conn {
       upstream_conn,
       events,
       tx: proxy.TxTracker.new(),
-      next_id: 0,
       prepared_stmts: Map.new(),
       prepared_stmt_oids: Map.new(),
-      last_parse: "",
       last_param_oids: [],
       last_bind_args: [],
-      last_bind_stmt: "",
       pending_describes: [],
-      pending: None,
+      ..
     }
   }
 
@@ -112,7 +109,7 @@ fn read_startup_raw(r: net.Conn) -> Result<Slice<byte>, error> {
   }
   let mut buf: Slice<byte> = new_bytes(msg_len as int)
   copy_into(buf, hdr, 0)
-  read_full(r, buf[4..buf.length()])?
+  read_full(r, buf[4..])?
   Ok(buf)
 }
 
@@ -190,13 +187,11 @@ fn relay_startup(c: Ref<Conn>) -> Result<(), error> {
       return Ok(())
     } else if type_byte == ascii('E') {
       return Err(mk_error("postgres: auth error from upstream"))
-    } else if type_byte == ascii('R') {
-      if msg.length() >= 9 {
-        let auth_type = binary.BigEndian.Uint32(msg[5..9])
-        if auth_type != AUTH_TYPE_OK && auth_type != AUTH_TYPE_SASL_FINAL {
-          let resp = read_message_raw(c.client_conn)?
-          write_all(c.upstream_conn, resp)?
-        }
+    } else if type_byte == ascii('R') && msg.length() >= 9 {
+      let auth_type = binary.BigEndian.Uint32(msg[5..9])
+      if auth_type != AUTH_TYPE_OK && auth_type != AUTH_TYPE_SASL_FINAL {
+        let resp = read_message_raw(c.client_conn)?
+        write_all(c.upstream_conn, resp)?
       }
     }
   }
@@ -209,7 +204,7 @@ fn decline_byte() -> Slice<byte> {
 /// Run a single connection: startup phase, then spawn the two reader tasks and
 /// serve the actor loop until either side ends. `ctx` cancellation is handled
 /// by the caller closing both sockets.
-pub fn run_connection(
+fn run_connection(
   c: Ref<Conn>,
 ) -> Result<(), error> {
   relay_startup(c)?
@@ -277,16 +272,16 @@ fn actor_loop(c: Ref<Conn>, inbox: Channel<Frame>) -> Result<(), error> {
     match frame {
       Frame.FromClient(msg) => {
         capture_client(c, msg)
-        match write_all(c.upstream_conn, msg) {
-          Ok(_) => {},
-          Err(_) => { close_both(c); return Ok(()) },
+        if let Err(_) = write_all(c.upstream_conn, msg) {
+          close_both(c)
+          return Ok(())
         }
       },
       Frame.FromUpstream(msg) => {
         capture_upstream(c, msg)
-        match write_all(c.client_conn, msg) {
-          Ok(_) => {},
-          Err(_) => { close_both(c); return Ok(()) },
+        if let Err(_) = write_all(c.client_conn, msg) {
+          close_both(c)
+          return Ok(())
         }
       },
       Frame.ClientDone(err) => {
@@ -321,7 +316,7 @@ fn capture_client(c: Ref<Conn>, msg: Slice<byte>) {
     return
   }
   let type_byte = msg[0]
-  let payload = msg[5..msg.length()]
+  let payload = msg[5..]
   if type_byte == ascii('Q') {
     handle_simple_query(c, payload)
   } else if type_byte == ascii('P') {
@@ -374,9 +369,8 @@ fn handle_bind(c: Ref<Conn>, payload: Slice<byte>) {
 
   let mut param_oids = c.last_param_oids.clone()
   if m.stmt_name != "" {
-    match c.prepared_stmt_oids.get(m.stmt_name) {
-      Some(oids) => { param_oids = oids.clone() },
-      None => {},
+    if let Some(oids) = c.prepared_stmt_oids.get(m.stmt_name) {
+      param_oids = oids.clone()
     }
   }
 
@@ -395,9 +389,8 @@ fn handle_bind(c: Ref<Conn>, payload: Slice<byte>) {
 fn handle_execute(c: Ref<Conn>) {
   let mut q = c.last_parse
   if c.last_bind_stmt != "" {
-    match c.prepared_stmts.get(c.last_bind_stmt) {
-      Some(stored) => { q = stored },
-      None => {},
+    if let Some(stored) = c.prepared_stmts.get(c.last_bind_stmt) {
+      q = stored
     }
   }
   let id = c.generate_id()
@@ -421,9 +414,7 @@ fn new_pending(
     duration: 0 as time.Duration,
     outcome: event.Outcome.Ok { rows_affected: 0 },
     tx_id: info.tx_id,
-    nplus1: false,
-    slow: false,
-    normalized_query: "",
+    ..
   }
 }
 
@@ -434,7 +425,7 @@ fn capture_upstream(c: Ref<Conn>, msg: Slice<byte>) {
     return
   }
   let type_byte = msg[0]
-  let payload = msg[5..msg.length()]
+  let payload = msg[5..]
   if type_byte == ascii('t') {
     handle_parameter_description(c, payload)
   } else if type_byte == ascii('C') {
@@ -447,11 +438,11 @@ fn capture_upstream(c: Ref<Conn>, msg: Slice<byte>) {
 }
 
 fn handle_parameter_description(c: Ref<Conn>, payload: Slice<byte>) {
-  if c.pending_describes.length() == 0 {
+  if c.pending_describes.is_empty() {
     return
   }
   let name = c.pending_describes[0]
-  c.pending_describes = c.pending_describes[1..c.pending_describes.length()]
+  c.pending_describes = c.pending_describes[1..]
 
   let oids = parse_parameter_description(payload)
   if name == "" {

@@ -82,7 +82,7 @@ impl Client {
     }
 
     let start = time.Now()
-    let mut rows = self.db
+    let rows = self.db
       .QueryContext(ctx, prefix(mode, self.dialect) + q, any_args...)
       .wrap_err("explain: query")?
     defer rows.Close()

@@ -17,7 +17,7 @@ pub enum ServeCommand {
 /// load the config file, and apply CLI overrides. Only flags explicitly
 /// passed override file values, mirroring the Go daemon.
 pub fn parse_serve(args: Slice<string>, output: io.Writer) -> ServeCommand {
-  let mut fs = flag.NewFlagSet("sqltap serve", flag.ContinueOnError)
+  let fs = flag.NewFlagSet("sqltap serve", flag.ContinueOnError)
   fs.SetOutput(output)
 
   let config_path = fs.String("config", "", "path to config file (default: .sql-tap.yaml)")

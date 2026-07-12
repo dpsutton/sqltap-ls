@@ -8,7 +8,6 @@ const ALT_SCREEN_LEAVE = "\x1b[?1049l"
 const CURSOR_HIDE = "\x1b[?25l"
 const CURSOR_SHOW = "\x1b[?25h"
 const CLEAR_HOME = "\x1b[H\x1b[2J"
-const CURSOR_HOME = "\x1b[H"
 
 /// The size of the terminal in character cells.
 pub struct Size {

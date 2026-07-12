@@ -110,7 +110,7 @@ fn index_of(xs: Slice<string>, target: string) -> Option<int> {
 }
 
 fn sorted_durations(ds: Slice<time.Duration>) -> Slice<time.Duration> {
-  let mut out = ds.map(|d| d as int64)
+  let out = ds.map(|d| d as int64)
   sort.Slice(out, |a, b| out[a] < out[b])
   out.map(|v| v as time.Duration)
 }
@@ -128,7 +128,7 @@ pub fn percentile(sorted: Slice<time.Duration>, p: float64) -> time.Duration {
 /// Sort analytics rows in place-equivalent (returns a new slice) by the given
 /// metric, descending.
 pub fn sort_analytics_rows(rows: Slice<AnalyticsRow>, mode: AnalyticsSort) -> Slice<AnalyticsRow> {
-  let mut out = rows.map(|r| r)
+  let out = rows.map(|r| r)
   sort.SliceStable(out, |a, b| row_less(out[a], out[b], mode))
   out
 }

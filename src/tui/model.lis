@@ -73,7 +73,7 @@ pub struct Input {
 
 impl Input {
   pub fn empty() -> Input {
-    Input { text: "", cursor: 0, active: false }
+    Input { .. }
   }
 }
 
@@ -165,9 +165,7 @@ impl Model {
   pub fn new() -> Model {
     Model {
       events: [],
-      cursor: 0,
       follow: true,
-      paused: false,
       width: 80,
       height: 24,
       collapsed: [],
@@ -178,21 +176,12 @@ impl Model {
       search: Input.empty(),
       filter: Input.empty(),
       sort: SortMode.Chronological,
-      write_mode: false,
-      alert: "",
-      alert_seq: 0,
-      inspect_scroll: 0,
       explain: ExplainState.Running,
       explain_kind: ExplainKind.Explain,
-      explain_query: "",
       explain_args: [],
-      explain_scroll: 0,
-      explain_hscroll: 0,
       analytics: [],
-      analytics_cursor: 0,
-      analytics_hscroll: 0,
       analytics_sort: AnalyticsSort.Total,
-      timeline_scroll: 0,
+      ..
     }
   }
 
@@ -203,12 +192,6 @@ impl Model {
   /// The color assigned to `tx_id`, or empty if none.
   pub fn tx_color(self, tx_id: string) -> string {
     self.tx_colors.find(|c| c.tx_id == tx_id).map_or("", |c| c.color)
-  }
-
-  /// True while any input is being edited or the write menu is open — the modes
-  /// that swallow list keybindings.
-  fn in_input_mode(self) -> bool {
-    self.search.active || self.filter.active || self.write_mode
   }
 
   /// True when a filter or search is applied (flat list, no tx grouping).
@@ -341,10 +324,10 @@ fn stick_to_tail_if_following(model: Model) -> Model {
 // --- explain / editor / export / alert result handling -------------------
 
 fn on_explain_result(model: Model, plan: Option<string>, error: Option<string>) -> Model {
-  let state = match error {
-    Some(msg) => ExplainState.Failed { message: msg },
-    None => ExplainState.Plan { text: plan.unwrap_or("") },
-  }
+  let state = error.map_or_else(
+    || ExplainState.Plan { text: plan.unwrap_or("") },
+    |msg| ExplainState.Failed { message: msg },
+  )
   Model { explain: state, ..model }
 }
 
@@ -390,13 +373,13 @@ fn on_editor_result(
 }
 
 fn on_export_result(model: Model, path: Option<string>, error: Option<string>) -> (Model, Effect) {
-  let msg = match error {
-    Some(e) => f"write error: {e}",
-    None => {
+  let msg = error.map_or_else(
+    || {
       let p = path.unwrap_or("")
       f"wrote: ./{p}"
     },
-  }
+    |e| f"write error: {e}",
+  )
   let (m, seq) = show_alert(model, msg)
   (m, Effect.Alert { seq })
 }
@@ -593,12 +576,12 @@ fn clear_filter(model: Model) -> Model {
 
 fn update_search(model: Model, key: Key) -> (Model, Effect) {
   let (input, action) = edit_input(model.search, key)
-  apply_input_edit(model, key, input, action, true)
+  apply_input_edit(model, input, action, true)
 }
 
 fn update_filter(model: Model, key: Key) -> (Model, Effect) {
   let (input, action) = edit_input(model.filter, key)
-  apply_input_edit(model, key, input, action, false)
+  apply_input_edit(model, input, action, false)
 }
 
 // What an input edit resolves to beyond producing a new Input value.
@@ -614,7 +597,7 @@ enum InputAction {
 fn edit_input(input: Input, key: Key) -> (Input, InputAction) {
   match key {
     Key.Enter => (Input { active: false, ..input }, InputAction.Accept),
-    Key.Esc => (Input { text: "", cursor: 0, active: false }, InputAction.Cancel),
+    Key.Esc => (Input { .. }, InputAction.Cancel),
     Key.CtrlC => (input, InputAction.Quit),
     Key.Backspace => {
       if input.cursor > 0 {
@@ -670,7 +653,7 @@ fn runes_to_str(runes: Slice<rune>, lo: int, hi: int) -> string {
   out
 }
 
-fn apply_input_edit(model: Model, key: Key, input: Input, action: InputAction, is_search: bool) -> (Model, Effect) {
+fn apply_input_edit(model: Model, input: Input, action: InputAction, is_search: bool) -> (Model, Effect) {
   let base = if is_search {
     Model { search: input, ..model }
   } else {
@@ -705,7 +688,7 @@ fn copy_query(model: Model, with_args: bool) -> (Model, Effect) {
   if ev.query == "" {
     return no_effect(model)
   }
-  let (m, seq) = show_alert(model, "copied!")
+  let (m, _seq) = show_alert(model, "copied!")
   let text = if with_args { query_bind(ev.query, ev.args) } else { ev.query }
   (m, Effect.CopyText { text })
 }
@@ -821,7 +804,7 @@ fn copy_plan(model: Model) -> (Model, Effect) {
       if text == "" {
         no_effect(model)
       } else {
-        let (m, seq) = show_alert(model, "copied!")
+        let (m, _seq) = show_alert(model, "copied!")
         (m, Effect.CopyText { text })
       }
     },
@@ -890,7 +873,7 @@ fn analytics_copy(model: Model) -> (Model, Effect) {
     return no_effect(model)
   }
   let text = model.analytics[model.analytics_cursor].query
-  let (m, seq) = show_alert(model, "copied!")
+  let (m, _seq) = show_alert(model, "copied!")
   (m, Effect.CopyText { text })
 }
 
@@ -986,7 +969,7 @@ fn rebuild_flat(model: Model, matched: Slice<int>) -> Model {
 
 fn sort_rows_by_duration(events: Slice<event.Event>, rows: Slice<Row>) -> Slice<Row> {
   // Extract event indices, stable-sort by duration desc, rebuild rows.
-  let mut out = rows.map(|r| row_idx(r))
+  let mut out = rows.map(row_idx)
   // insertion-style stable sort (rows are few; keeps deterministic order)
   let n = out.length()
   let mut i = 1

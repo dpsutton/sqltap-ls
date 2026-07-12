@@ -180,7 +180,7 @@ pub fn parse_bind(payload: Slice<byte>) -> Option<BindMsg> {
 /// True if the i-th parameter uses binary format. Per the protocol, a single
 /// format code applies to all parameters; zero codes means text for all.
 pub fn is_binary_format(codes: Slice<int16>, i: int) -> bool {
-  if codes.length() == 0 {
+  if codes.is_empty() {
     false
   } else if codes.length() == 1 {
     codes[0] == 1
@@ -270,12 +270,9 @@ fn format_uuid(p: Slice<byte>) -> string {
 /// token parsed as int64, or 0 on parse failure. e.g. "INSERT 0 5" -> 5.
 pub fn parse_rows_affected(tag: string) -> int64 {
   let parts = strings.Split(tag, " ")
-  if parts.length() == 0 { return 0 }
+  if parts.is_empty() { return 0 }
   let last = parts[parts.length() - 1]
-  match strconv.ParseInt(last, 10, 64) {
-    Ok(n) => n,
-    Err(_) => 0,
-  }
+  strconv.ParseInt(last, 10, 64).unwrap_or(0)
 }
 
 /// Extract the human-readable message ('M' field) from an ErrorResponse
@@ -321,5 +318,5 @@ pub fn parse_parameter_description(payload: Slice<byte>) -> Slice<uint32> {
 /// (not including) its trailing NUL.
 pub fn parse_simple_query(payload: Slice<byte>) -> string {
   let mut cur = Cursor.new(payload)
-  cur.cstring().unwrap_or(bytes_to_string(payload))
+  cur.cstring().unwrap_or_else(|| bytes_to_string(payload))
 }

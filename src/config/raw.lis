@@ -32,15 +32,12 @@ impl RawConfig {
   /// forms), so decoding overrides only the keys the file contains — mirroring
   /// Go's decode into a `Default()`-prefilled struct.
   fn defaults() -> RawConfig {
-    RawConfig { 
-      driver: "",
-      listen: "",
-      upstream: "",
+    RawConfig {
       grpc: ":9091",
-      http: "",
       dsn_env: "DATABASE_URL",
       slow_threshold: "100ms",
       nplus1: RawNplus1 { threshold: 5, window: "1s", cooldown: "10s" },
+      ..
     }
   }
 

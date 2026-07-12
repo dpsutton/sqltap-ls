@@ -17,6 +17,7 @@ const AN_COL_AVG = 10
 const AN_COL_P95 = 10
 const AN_COL_MAX = 10
 const AN_COL_TOTAL = 10
+const AN_COL_MARKER_2 = 2
 
 const TL_LABEL_WIDTH = 40
 
@@ -453,7 +454,7 @@ fn view_analytics(model: Model) -> string {
   let visible = analytics_visible_rows(model)
   let title = f" Analytics ({model.analytics.length()} templates) [sort: {model.analytics_sort.label()}] "
 
-  let fixed = AN_COL_MARKER_2() + AN_COL_COUNT + AN_COL_AVG + AN_COL_P95 + AN_COL_MAX + AN_COL_TOTAL + 6
+  let fixed = AN_COL_MARKER_2 + AN_COL_COUNT + AN_COL_AVG + AN_COL_P95 + AN_COL_MAX + AN_COL_TOTAL + 6
   let col_query = max_int(inner - fixed, 10)
 
   let h_count = pad_left("Count", AN_COL_COUNT)
@@ -483,10 +484,6 @@ fn view_analytics(model: Model) -> string {
   let content = strings.Join(lines, "\n")
   let help = " q: back  j/k: scroll  h/l: pan  s: sort  c: copy "
   boxed_with_help(content, title, help, inner)
-}
-
-fn AN_COL_MARKER_2() -> int {
-  2
 }
 
 fn analytics_row_line(model: Model, i: int, col_query: int) -> string {

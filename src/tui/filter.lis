@@ -89,8 +89,7 @@ fn parse_duration(tok: string) -> Option<FilterCond> {
 
 fn unit_suffix(unit: string) -> string {
   match unit {
-    "us" => "us",
-    "µs" => "us",
+    "us" | "µs" => "us",
     "ms" => "ms",
     "s" => "s",
     "m" => "m",

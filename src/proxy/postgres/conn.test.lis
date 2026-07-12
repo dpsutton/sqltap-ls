@@ -46,7 +46,7 @@ fn parse_payload(name: string, query: string, oids: Slice<uint32>) -> Slice<byte
 }
 
 fn describe_payload(name: string) -> Slice<byte> {
-  let mut buf: Slice<byte> = [ascii('S')]
+  let buf: Slice<byte> = [ascii('S')]
   append_cstring(buf, name)
 }
 

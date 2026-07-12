@@ -10,17 +10,14 @@ fn fev(op: event.Op, query: string, dur: time.Duration, err_msg: string) -> even
     event.Outcome.Ok { rows_affected: 0 }
   }
   event.Event {
-    id: "",
     op,
     query,
     args: [],
     start_time: time.Date(2026, time.July, 12, 0, 0, 0, 0, time.UTC),
     duration: dur,
     outcome,
-    tx_id: None,
-    nplus1: false,
-    slow: false,
     normalized_query: query,
+    ..
   }
 }
 

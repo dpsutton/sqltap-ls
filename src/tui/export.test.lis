@@ -6,17 +6,14 @@ import "event"
 
 fn xev(op: event.Op, query: string, normalized: string, args: Slice<string>, dur: time.Duration, start: time.Time) -> event.Event {
   event.Event {
-    id: "",
     op,
     query,
     args,
     start_time: start,
     duration: dur,
     outcome: event.Outcome.Ok { rows_affected: 0 },
-    tx_id: None,
-    nplus1: false,
-    slow: false,
     normalized_query: normalized,
+    ..
   }
 }
 

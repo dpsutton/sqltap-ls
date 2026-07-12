@@ -77,15 +77,11 @@ fn read_framed(conn: net.Conn) -> Result<Slice<byte>, error> {
 fn start_fake_upstream(command_tag: string) -> Result<(net.Listener, string), error> {
   let mut lc = net.ListenConfig { .. }
   let listener = lc.Listen(context.Background(), "tcp", "127.0.0.1:0")?
-  let addr = match listener.Addr() {
-    Some(a) => a.String(),
-    None => "",
-  }
+  let addr = listener.Addr().map_or("", |a| a.String())
 
   task {
-    match listener.Accept() {
-      Ok(conn) => { let _ = serve_fake(conn, command_tag) },
-      Err(_) => {},
+    if let Ok(conn) = listener.Accept() {
+      let _ = serve_fake(conn, command_tag)
     }
   }
 
@@ -132,11 +128,8 @@ fn test_relay_simple_query() -> Result<(), error> {
   // Bind the proxy to an ephemeral loopback port.
   let mut lc = net.ListenConfig { .. }
   let probe = lc.Listen(ctx, "tcp", "127.0.0.1:0")?
-  let proxy_addr = match probe.Addr() {
-    Some(a) => a.String(),
-    None => "",
-  }
-  probe.Close()
+  let proxy_addr = probe.Addr().map_or("", |a| a.String())
+  let _ = probe.Close()
 
   task {
     let _ = listen_and_serve(ctx, proxy_addr, up_addr, events)
@@ -144,10 +137,7 @@ fn test_relay_simple_query() -> Result<(), error> {
 
   // Dial the proxy as a client, retrying until it is listening.
   let mut dialer = net.Dialer { .. }
-  let mut client = match dial_retry(&dialer, ctx, proxy_addr) {
-    Ok(c) => c,
-    Err(e) => return Err(e),
-  }
+  let client = dial_retry(&dialer, ctx, proxy_addr)?
   defer client.Close()
 
   // Minimal client handshake: StartupMessage (protocol 3.0, user=test).

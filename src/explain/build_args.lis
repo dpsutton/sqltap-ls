@@ -23,12 +23,9 @@ fn build_any_args(query: string, args: Slice<string>) -> Slice<Unknown> {
   for (i, a) in args.enumerate() {
     let is_ts = ts_params.get(i + 1).unwrap_or(false)
     if is_ts {
-      match parse_pg_timestamp(a) {
-        Some(t) => {
-          any_args = any_args.append(t)
-          continue
-        },
-        None => (),
+      if let Some(t) = parse_pg_timestamp(a) {
+        any_args = any_args.append(t)
+        continue
       }
     }
     any_args = any_args.append(a)

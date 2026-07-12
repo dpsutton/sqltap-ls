@@ -203,13 +203,10 @@ fn edit_query(
   }
   let path = file.Name()
   let header = editor_header(kind)
-  match file.WriteString(header + query) {
-    Partial.Err(e) => {
-      let _ = file.Close()
-      let _ = os.Remove(path)
-      return editor_error(kind, e)
-    },
-    _ => (),
+  if let Partial.Err(e) = file.WriteString(header + query) {
+    let _ = file.Close()
+    let _ = os.Remove(path)
+    return editor_error(kind, e)
   }
   let _ = file.Close()
 

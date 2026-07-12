@@ -238,7 +238,7 @@ fn test_editor_result() {
 
 #[test("tui: editor result with empty query cancels")]
 fn test_editor_cancel() {
-  let mut m = feed_events([gev("a", event.Op.Query, "SELECT 1", 1 * time.Millisecond, None)])
+  let m = feed_events([gev("a", event.Op.Query, "SELECT 1", 1 * time.Millisecond, None)])
   let (m2, effect) = update(m, Msg.EditorResult { query: None, args: [], kind: ExplainKind.Explain, error: None })
   let assert Screen.List = m2.screen
   let assert Effect.Nothing = effect
@@ -248,7 +248,7 @@ fn test_editor_cancel() {
 
 #[test("tui: c copies the query and shows an alert")]
 fn test_copy() {
-  let mut m = feed_events([gev("a", event.Op.Query, "SELECT 1", 1 * time.Millisecond, None)])
+  let m = feed_events([gev("a", event.Op.Query, "SELECT 1", 1 * time.Millisecond, None)])
   let (m2, effect) = update(m, Msg.Press(Key.Char('c')))
   assert m2.alert == "copied!"
   let assert Effect.CopyText { text: "SELECT 1" } = effect
@@ -258,7 +258,7 @@ fn test_copy() {
 
 #[test("tui: n+1 event triggers an alert with truncated query text")]
 fn test_nplus1_alert() {
-  let mut m = Model.new()
+  let m = Model.new()
   let (m2, effect) = update(m, Msg.Incoming(flag_ev("n1", "SELECT * FROM users WHERE id = 1", true, false)))
   assert strings.HasPrefix(m2.alert, "N+1 detected: ")
   let assert Effect.Alert { .. } = effect
@@ -266,7 +266,7 @@ fn test_nplus1_alert() {
 
 #[test("tui: slow event alert says Slow query")]
 fn test_slow_alert() {
-  let mut m = Model.new()
+  let m = Model.new()
   let (m2, _) = update(m, Msg.Incoming(flag_ev("s1", "SELECT slow", false, true)))
   assert strings.HasPrefix(m2.alert, "Slow query: ")
 }
@@ -286,7 +286,7 @@ fn test_alert_seq_guard() {
 #[test("tui: alert text truncates long queries to 60 chars")]
 fn test_alert_truncation() {
   let long = strings.Repeat("x", 100)
-  let mut m = Model.new()
+  let m = Model.new()
   let (m2, _) = update(m, Msg.Incoming(flag_ev("n1", long, true, false)))
   // "N+1 detected: " + 57 chars + "..."
   assert strings.Contains(m2.alert, "...")
@@ -449,7 +449,7 @@ fn test_filter_footer() {
 
 #[test("tui: alert overlay renders over the list frame")]
 fn test_alert_overlay() {
-  let mut m = Model.new()
+  let m = Model.new()
   let (m2, _) = update(m, Msg.Incoming(flag_ev("n1", "SELECT x", true, false)))
   let frame = strip(view(m2, 100, 24))
   assert frame.contains("N+1 detected")
