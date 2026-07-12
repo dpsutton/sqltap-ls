@@ -3,6 +3,7 @@ name = "sqltap-ls"
 version = "0.1.0"
 
 [dependencies.go]
+"go.yaml.in/yaml/v3" = "v3.0.4"
 "github.com/go-sql-driver/mysql" = "v1.9.3"
 "filippo.io/edwards25519" = { version = "v1.1.0", via = ["github.com/go-sql-driver/mysql"] }
 "github.com/jackc/pgx/v5" = "v5.8.0"
