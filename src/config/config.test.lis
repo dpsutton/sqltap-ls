@@ -1,0 +1,164 @@
+import "go:os"
+import "go:path/filepath"
+import "go:time"
+
+/// Writes `content` to a fresh temp file and returns its path.
+fn write_temp(t: TestContext, content: string) -> string {
+  let dir = os.MkdirTemp("", "sqltap-config")
+  let mut created = ""
+  match dir {
+    Ok(d) => {
+      created = d
+    },
+    Err(e) => {
+      t.log(f"MkdirTemp failed: {e}")
+      assert false
+    },
+  }
+  let path = filepath.Join(created, "config.yaml")
+  let bytes = content as Slice<byte>
+  let mode = 0o600 as os.FileMode
+  if let Err(e) = os.WriteFile(path, bytes, mode) {
+    t.log(f"WriteFile failed: {e}")
+    assert false
+  }
+  path
+}
+
+#[test("default() returns the documented defaults")]
+fn test_default() {
+  let cfg = Config.default()
+  assert cfg.api_addr == ":9091"
+  assert cfg.dsn_env == "DATABASE_URL"
+  assert cfg.slow_threshold == (100 as time.Duration) * time.Millisecond
+  assert cfg.nplus1.threshold == 5
+  assert cfg.nplus1.window == (1 as time.Duration) * time.Second
+  assert cfg.nplus1.cooldown == (10 as time.Duration) * time.Second
+  assert cfg.driver == None
+  assert cfg.listen == ""
+  assert cfg.upstream == ""
+  assert cfg.http == ""
+}
+
+#[test("load reads a full explicit config file")]
+fn test_load_explicit_path(t: TestContext) -> Result<(), error> {
+  let content = "
+driver: postgres
+listen: \":5433\"
+upstream: \"localhost:5432\"
+grpc: \":9999\"
+http: \":8080\"
+dsn_env: MY_DSN
+slow_threshold: 200ms
+nplus1:
+  threshold: 10
+  window: 2s
+  cooldown: 30s
+"
+  let path = write_temp(t, content)
+  let cfg = load(path)?
+
+  let assert Some(driver) = cfg.driver
+  assert driver == Driver.Postgres
+  assert cfg.listen == ":5433"
+  assert cfg.upstream == "localhost:5432"
+  assert cfg.api_addr == ":9999"
+  assert cfg.http == ":8080"
+  assert cfg.dsn_env == "MY_DSN"
+  assert cfg.slow_threshold == (200 as time.Duration) * time.Millisecond
+  assert cfg.nplus1.threshold == 10
+  assert cfg.nplus1.window == (2 as time.Duration) * time.Second
+  assert cfg.nplus1.cooldown == (30 as time.Duration) * time.Second
+  Ok(())
+}
+
+#[test("load keeps defaults for keys the file omits")]
+fn test_load_partial_override(t: TestContext) -> Result<(), error> {
+  let content = "
+driver: mysql
+listen: \":3307\"
+upstream: \"localhost:3306\"
+"
+  let path = write_temp(t, content)
+  let cfg = load(path)?
+
+  let assert Some(driver) = cfg.driver
+  assert driver == Driver.Mysql
+  // Defaults preserved for unset fields.
+  assert cfg.api_addr == ":9091"
+  assert cfg.nplus1.threshold == 5
+  assert cfg.slow_threshold == (100 as time.Duration) * time.Millisecond
+  assert cfg.nplus1.window == (1 as time.Duration) * time.Second
+  Ok(())
+}
+
+#[test("load with empty path and no default file returns defaults")]
+fn test_load_no_default_file(t: TestContext) -> Result<(), error> {
+  let dir = os.MkdirTemp("", "sqltap-nodefault")?
+  let orig = os.Getwd()?
+  os.Chdir(dir)?
+  defer {
+    let _ = os.Chdir(orig)
+  }
+
+  let cfg = load("")?
+  let want = Config.default()
+  assert cfg.api_addr == want.api_addr
+  assert cfg.dsn_env == want.dsn_env
+  assert cfg.driver == None
+  Ok(())
+}
+
+#[test("load errors when an explicit path is missing")]
+fn test_load_file_not_found() {
+  let result = load("/nonexistent/path.yaml")
+  let assert Err(_) = result
+}
+
+#[test("load errors on invalid YAML")]
+fn test_load_invalid_yaml(t: TestContext) {
+  let path = write_temp(t, "driver: [invalid yaml")
+  let result = load(path)
+  let assert Err(_) = result
+}
+
+#[test("load errors on an unknown key")]
+fn test_load_unknown_field(t: TestContext) {
+  let content = "
+driver: postgres
+grcp: \":9999\"
+"
+  let path = write_temp(t, content)
+  let result = load(path)
+  let assert Err(_) = result
+}
+
+#[test("load errors on an unparseable duration")]
+fn test_load_bad_duration(t: TestContext) {
+  let path = write_temp(t, "slow_threshold: not-a-duration")
+  let result = load(path)
+  let assert Err(_) = result
+}
+
+#[test("load errors on an unknown driver")]
+fn test_load_bad_driver(t: TestContext) {
+  let path = write_temp(t, "driver: oracle")
+  let result = load(path)
+  let assert Err(_) = result
+}
+
+#[test("driver parse and name round-trip")]
+fn test_driver_parse_and_name() -> Result<(), error> {
+  let pg = Driver.parse("postgres")?
+  let my = Driver.parse("mysql")?
+  let ti = Driver.parse("tidb")?
+  assert pg == Driver.Postgres
+  assert my == Driver.Mysql
+  assert ti == Driver.Tidb
+  let assert Err(_) = Driver.parse("nope")
+  assert Driver.Postgres.name() == "postgres"
+  assert Driver.Mysql.name() == "mysql"
+  assert Driver.Tidb.name() == "tidb"
+  assert f"{Driver.Tidb}" == "Tidb"
+  Ok(())
+}

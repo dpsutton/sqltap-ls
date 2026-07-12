@@ -1,0 +1,107 @@
+import "go:fmt"
+import "go:time"
+
+/// The raw on-disk shape of the config file, mirroring the YAML keys exactly.
+///
+/// This is decoded into a value pre-filled with default-equivalent sentinels
+/// (`RawConfig.defaults`), exactly like Go decodes into a defaults-prefilled
+/// struct: keys the file omits keep their default, a key present with an empty
+/// value overrides. Durations arrive as YAML strings like "100ms" / "1s" and
+/// are parsed with `time.ParseDuration` in `into_config`.
+///
+/// The prelude `Option` type has no YAML unmarshaler, so this raw struct uses
+/// plain-typed fields with sentinel defaults rather than `Option` presence
+/// tracking (see `config.lis` for the deviation note).
+#[yaml]
+struct RawConfig {
+  driver: string,
+  listen: string,
+  upstream: string,
+  grpc: string,
+  http: string,
+  dsn_env: string,
+  slow_threshold: string,
+  nplus1: RawNplus1,
+}
+
+#[yaml]
+struct RawNplus1 { threshold: int, window: string, cooldown: string }
+
+impl RawConfig {
+  /// A raw config pre-filled with the default values (as their on-disk string
+  /// forms), so decoding overrides only the keys the file contains — mirroring
+  /// Go's decode into a `Default()`-prefilled struct.
+  fn defaults() -> RawConfig {
+    RawConfig { 
+      driver: "",
+      listen: "",
+      upstream: "",
+      grpc: ":9091",
+      http: "",
+      dsn_env: "DATABASE_URL",
+      slow_threshold: "100ms",
+      nplus1: RawNplus1 { threshold: 5, window: "1s", cooldown: "10s" },
+    }
+  }
+
+  /// Converts the decoded raw config into the typed `Config`, parsing durations
+  /// and the driver. `path` is used only to give parse errors a config-file
+  /// mention.
+  fn into_config(self, path: string) -> Result<Config, error> {
+    let driver = if self.driver == "" {
+      None
+    } else {
+      Some(parse_driver_field(self.driver, path)?)
+    }
+    let slow_threshold = parse_duration_field(
+      self.slow_threshold,
+      "slow_threshold",
+      path,
+    )?
+    let window = parse_duration_field(self.nplus1.window, "nplus1.window", path)?
+    let cooldown = parse_duration_field(
+      self.nplus1.cooldown,
+      "nplus1.cooldown",
+      path,
+    )?
+
+    Ok(
+      Config { 
+        driver,
+        listen: self.listen,
+        upstream: self.upstream,
+        api_addr: self.grpc,
+        http: self.http,
+        dsn_env: self.dsn_env,
+        slow_threshold,
+        nplus1: Nplus1Config { 
+          threshold: self.nplus1.threshold,
+          window,
+          cooldown,
+        },
+      },
+    )
+  }
+}
+
+/// Parses a duration string, wrapping failures with the offending key and path.
+fn parse_duration_field(value: string, key: string, path: string) -> Result<time.Duration, error> {
+  let parsed = try {
+    time.ParseDuration(value)?
+  }
+  match parsed {
+    Ok(d) => Ok(d),
+    Err(e) => Err(fmt.Errorf("parse config %s: %s: %w", path, key, e)),
+  }
+}
+
+/// Parses the driver field, wrapping failures with the path.
+fn parse_driver_field(value: string, path: string) -> Result<Driver, error> {
+  let parsed = try {
+    Driver.parse(value)?
+  }
+  match parsed {
+    Ok(d) => Ok(d),
+    Err(e) => Err(fmt.Errorf("parse config %s: driver: %w", path, e)),
+  }
+}

@@ -1,3 +1,6 @@
 [project]
 name = "sqltap-ls"
 version = "0.1.0"
+
+[dependencies.go]
+"go.yaml.in/yaml/v3" = "v3.0.4"

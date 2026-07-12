@@ -1,0 +1,120 @@
+import "go:bytes"
+import "go:errors"
+import "go:fmt"
+import "go:go.yaml.in/yaml/v3"
+import "go:os"
+import "go:time"
+
+/// A supported database wire protocol.
+#[display]
+pub enum Driver {
+  Postgres,
+  Mysql,
+  Tidb,
+}
+
+impl Driver {
+  /// Parses a driver name as it appears in the config file.
+  pub fn parse(name: string) -> Result<Driver, error> {
+    match name {
+      "postgres" => Ok(Driver.Postgres),
+      "mysql" => Ok(Driver.Mysql),
+      "tidb" => Ok(Driver.Tidb),
+      _ => Err(errors.New(f"unknown driver {name}")),
+    }
+  }
+
+  /// The lowercase config-file name of this driver.
+  pub fn name(self) -> string {
+    match self {
+      Driver.Postgres => "postgres",
+      Driver.Mysql => "mysql",
+      Driver.Tidb => "tidb",
+    }
+  }
+}
+
+/// N+1 detection settings.
+pub struct Nplus1Config {
+  pub threshold: int,
+  pub window: time.Duration,
+  pub cooldown: time.Duration,
+}
+
+/// The typed sql-tapd configuration.
+///
+/// `listen`, `upstream`, and `http` stay plain strings; their required-ness is
+/// validated by the CLI layer, not here. `driver` is optional because the file
+/// may omit it. `api_addr` carries the value of the config file's `grpc` key —
+/// the port replaces the Go daemon's gRPC API with a plain HTTP API on the same
+/// default port, but the YAML key stays `grpc` for config-file compatibility.
+pub struct Config {
+  pub driver: Option<Driver>,
+  pub listen: string,
+  pub upstream: string,
+  pub api_addr: string,
+  pub http: string,
+  pub dsn_env: string,
+  pub slow_threshold: time.Duration,
+  pub nplus1: Nplus1Config,
+}
+
+impl Config {
+  /// The default configuration, matching the Go `config.Default()`.
+  pub fn default() -> Config {
+    Config { 
+      driver: None,
+      listen: "",
+      upstream: "",
+      api_addr: ":9091",
+      http: "",
+      dsn_env: "DATABASE_URL",
+      slow_threshold: (100 as time.Duration) * time.Millisecond,
+      nplus1: Nplus1Config { 
+        threshold: 5,
+        window: (1 as time.Duration) * time.Second,
+        cooldown: (10 as time.Duration) * time.Second,
+      },
+    }
+  }
+}
+
+/// The config file name looked up in the current directory when no path is
+/// given.
+const DEFAULT_CONFIG_FILE = ".sql-tap.yaml"
+
+/// Reads the config file at `path`. If `path` is empty, it looks for the
+/// default config file in the current directory; if that file does not exist it
+/// returns the default config without error. An explicit path (or an existing
+/// default file) is read and strict-parsed: unknown keys are errors, matching
+/// Go's `yaml.Decoder.KnownFields(true)`. Parsed values overlay the defaults —
+/// absent keys keep their default, an explicitly empty value overrides.
+pub fn load(path: string) -> Result<Config, error> {
+  let mut file_path = path
+
+  if file_path == "" {
+    file_path = DEFAULT_CONFIG_FILE
+    let stat_result = try {
+      os.Stat(file_path)?
+    }
+    if let Err(e) = stat_result {
+      if errors.Is(e, os.ErrNotExist) { return Ok(Config.default()) }
+    }
+  }
+
+  let data = os.ReadFile(file_path).wrap_err(f"read config {file_path}")?
+
+  let reader = bytes.NewReader(data)
+  let dec = yaml.NewDecoder(reader)
+  dec.KnownFields(true)
+
+  let mut raw = RawConfig.defaults()
+  let decode_result = try {
+    dec.Decode(&raw)?
+  }
+  if let Err(e) = decode_result {
+    return Err(fmt.Errorf("parse config %s: %w", file_path, e))
+  }
+
+  raw.into_config(file_path)
+}
