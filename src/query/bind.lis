@@ -11,9 +11,7 @@ import "go:strings"
 /// Otherwise MySQL-style `?` placeholders are filled left-to-right with args
 /// until the args are exhausted.
 pub fn bind(sql: string, args: Slice<string>) -> string {
-  if args.is_empty() {
-    return sql
-  }
+  if args.is_empty() { return sql }
 
   let quoted = args.map(quote_arg)
 
@@ -30,9 +28,7 @@ pub fn bind(sql: string, args: Slice<string>) -> string {
     }
     idx -= 1
   }
-  if replaced {
-    return pg
-  }
+  if replaced { return pg }
 
   // Fall back to MySQL-style: ? filled left-to-right.
   let bytes = sql.bytes()
@@ -40,7 +36,8 @@ pub fn bind(sql: string, args: Slice<string>) -> string {
   let mut out: Slice<byte> = []
   let mut arg_idx = 0
   for i in 0..n {
-    if bytes[i] == 63 && arg_idx < quoted.length() { // '?'
+    if bytes[i] == 63 && arg_idx < quoted.length() {
+      // '?'
       for b in quoted[arg_idx].bytes() {
         out = out.append(b)
       }
@@ -56,12 +53,8 @@ pub fn bind(sql: string, args: Slice<string>) -> string {
 /// Values parseable as a float, and the literals `true`/`false`/`null`/`NULL`,
 /// are left bare.
 fn quote_arg(s: string) -> string {
-  if let Ok(_) = strconv.ParseFloat(s, 64) {
-    return s
-  }
-  if s == "true" || s == "false" || s == "null" || s == "NULL" {
-    return s
-  }
+  if let Ok(_) = strconv.ParseFloat(s, 64) { return s }
+  if s == "true" || s == "false" || s == "null" || s == "NULL" { return s }
   let escaped = strings.ReplaceAll(s, "'", "''")
   f"'{escaped}'"
 }

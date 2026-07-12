@@ -1,13 +1,12 @@
-import "event"
 import "go:crypto/rand"
 import "go:encoding/hex"
 import "go:strings"
 
+import "event"
+
 /// Per-connection transaction state. Owned by a single connection actor,
 /// so no locking is needed.
-pub struct TxTracker {
-  active: Option<string>,
-}
+pub struct TxTracker { active: Option<string> }
 
 /// The transaction id and (possibly overridden) op for one statement.
 pub struct TxInfo {
@@ -30,7 +29,8 @@ impl TxTracker {
     fresh_id: string,
   ) -> TxInfo {
     let upper = strings.ToUpper(strings.TrimSpace(query))
-    if strings.HasPrefix(upper, "BEGIN") || strings.HasPrefix(upper, "START TRANSACTION") {
+    if strings.HasPrefix(upper, "BEGIN") ||
+    strings.HasPrefix(upper, "START TRANSACTION") {
       self.active = Some(fresh_id)
       TxInfo { tx_id: Some(fresh_id), op: event.Op.Begin }
     } else if strings.HasPrefix(upper, "COMMIT") {

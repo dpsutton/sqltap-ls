@@ -1,15 +1,23 @@
 /// SQL query normalization: replace literal values with placeholders so that
 /// structurally identical queries can be grouped together.
-
 const SPACE: byte = 32 // ' '
+
 const TAB: byte = 9 // '\t'
+
 const NEWLINE: byte = 10 // '\n'
+
 const CARRIAGE: byte = 13 // '\r'
+
 const QUOTE: byte = 39 // '\''
+
 const DOLLAR: byte = 36 // '$'
+
 const QUESTION: byte = 63 // '?'
+
 const DOT: byte = 46 // '.'
+
 const ZERO: byte = 48 // '0'
+
 const NINE: byte = 57 // '9'
 
 fn is_digit(c: byte) -> bool {
@@ -24,9 +32,12 @@ fn is_space(c: byte) -> bool {
 /// literal: whitespace and the SQL operator/punctuation set.
 fn is_num_boundary(c: byte) -> bool {
   // ',' '(' ')' '=' '<' '>' '+' '-' '*' '/' ';'
-  is_space(c) ||
-    c == 44 || c == 40 || c == 41 || c == 61 || c == 60 || c == 62 ||
-    c == 43 || c == 45 || c == 42 || c == 47 || c == 59
+  is_space(c) || c == 44 || c == 40 || c == 41 || c == 61 || c == 60 || c == 62 ||
+  c == 43 ||
+  c == 45 ||
+  c == 42 ||
+  c == 47 ||
+  c == 59
 }
 
 /// Replaces literal values in a SQL query with placeholders.
@@ -36,9 +47,7 @@ fn is_num_boundary(c: byte) -> bool {
 /// Consecutive whitespace is collapsed to a single space, and leading and
 /// trailing spaces are trimmed. An empty input yields an empty output.
 pub fn normalize(sql: string) -> string {
-  if sql == "" {
-    return ""
-  }
+  if sql == "" { return "" }
 
   let bytes = sql.bytes()
   let n = bytes.length()
@@ -126,11 +135,7 @@ fn scan_number(bytes: Slice<byte>, pos: int) -> Option<int> {
   while j < n && (is_digit(bytes[j]) || bytes[j] == DOT) {
     j += 1
   }
-  if j >= n || is_num_boundary(bytes[j]) {
-    Some(j)
-  } else {
-    None
-  }
+  if j >= n || is_num_boundary(bytes[j]) { Some(j) } else { None }
 }
 
 /// Builds a string from `out`, trimming trailing ASCII spaces (matching Go's

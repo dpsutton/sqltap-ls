@@ -4,12 +4,12 @@ import "event"
 /// published events until the subscription is dropped; `id` identifies it for
 /// `Broker.unsubscribe`.
 pub struct Subscription {
-  /// Receiving end of this subscriber's buffered channel. Closed on unsubscribe.
   pub events: Channel<event.Event>,
-  /// Opaque handle for `Broker.unsubscribe`.
   pub id: int,
 }
 
+/// Receiving end of this subscriber's buffered channel. Closed on unsubscribe.
+/// Opaque handle for `Broker.unsubscribe`.
 /// Messages driving the broker actor. The actor owns all mutable state
 /// (the subscriber map and id counter), so no locking is needed.
 enum Command {
@@ -30,9 +30,7 @@ enum Command {
 /// A single actor task owns the subscriber map; all operations are messages on
 /// `commands`, so the broker is safe to share across tasks without locks.
 /// Slow subscribers silently drop events: `publish` never blocks the caller.
-pub struct Broker {
-  commands: Channel<Command>,
-}
+pub struct Broker { commands: Channel<Command> }
 
 impl Broker {
   /// Create a broker whose subscriber channels are buffered with `buf_size`
@@ -97,7 +95,7 @@ fn run_actor(commands: Channel<Command>, buf_size: int) {
   loop {
     let Some(cmd) = commands.receive() else {
       break
-    };
+    }
     match cmd {
       Command.Subscribe { reply } => {
         let id = next_id

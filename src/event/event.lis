@@ -51,7 +51,10 @@ impl Outcome {
   }
 
   pub fn is_failed(self) -> bool {
-    match self { Outcome.Failed { .. } => true, Outcome.Ok { .. } => false }
+    match self {
+      Outcome.Failed { .. } => true,
+      Outcome.Ok { .. } => false,
+    }
   }
 }
 
@@ -64,16 +67,16 @@ pub struct Event {
   pub start_time: time.Time,
   pub duration: time.Duration,
   pub outcome: Outcome,
-  /// Transaction this event belongs to, when one is active.
   pub tx_id: Option<string>,
-  /// Flagged by the N+1 detector.
   pub nplus1: bool,
-  /// Duration met the slow-query threshold.
   pub slow: bool,
-  /// Query with literals replaced by placeholders; empty when query is empty.
   pub normalized_query: string,
 }
 
+/// Transaction this event belongs to, when one is active.
+/// Flagged by the N+1 detector.
+/// Duration met the slow-query threshold.
+/// Query with literals replaced by placeholders; empty when query is empty.
 impl Event {
   pub fn duration_ms(self) -> float64 {
     (self.duration.Microseconds() as float64) / 1000.0

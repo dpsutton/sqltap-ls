@@ -28,7 +28,11 @@ fn test_tx_lifecycle() {
 fn test_rollback_and_start() {
   let mut tracker = TxTracker.new()
 
-  let begin = tracker.transition("  start transaction isolation level serializable", event.Op.Execute, "id-9")
+  let begin = tracker.transition(
+    "  start transaction isolation level serializable",
+    event.Op.Execute,
+    "id-9",
+  )
   assert begin.op == event.Op.Begin
   let assert Some(id) = begin.tx_id
   assert id == "id-9"

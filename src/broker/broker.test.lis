@@ -1,9 +1,10 @@
-import "event"
 import "go:time"
+
+import "event"
 
 /// Build a minimal event carrying just an id (and optional query) for tests.
 fn make_event(id: string, query: string) -> event.Event {
-  event.Event {
+  event.Event { 
     id,
     op: event.Op.Query,
     query,
@@ -11,7 +12,7 @@ fn make_event(id: string, query: string) -> event.Event {
     start_time: time.Now(),
     duration: 0 as time.Duration,
     outcome: event.Outcome.Ok { rows_affected: 0 },
-    ..
+    ..,
   }
 }
 
@@ -159,9 +160,7 @@ fn test_concurrent_publish() {
       let Some(_) = sub.events.receive() => true,
       _ => false,
     }
-    if !more {
-      break
-    }
+    if !more { break }
     count += 1
   }
   assert count == n

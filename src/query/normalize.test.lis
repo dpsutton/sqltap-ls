@@ -38,10 +38,13 @@ fn test_normalize(t: TestContext) {
   ]
 
   for (name, input, want) in cases {
-    t.run(name, |_| {
-      let got = normalize(input)
-      assert got == want
-    })
+    t.run(
+      name,
+      |_| {
+        let got = normalize(input)
+        assert got == want
+      },
+    )
   }
 }
 
