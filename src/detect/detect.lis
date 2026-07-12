@@ -1,0 +1,85 @@
+import "go:time"
+
+/// A detected N+1 query pattern: the query template plus how many occurrences
+/// fell inside the window when the alert fired.
+pub struct Alert {
+  pub query: string,
+  pub count: int,
+}
+
+/// The outcome of a single `Detector.record` call.
+///
+/// `matched` is true whenever the query's in-window count is at or above the
+/// threshold — use it to flag every event in the pattern. `alert` is `Some`
+/// only when the threshold is freshly crossed (respecting cooldown) — use it
+/// to fire a one-time notification.
+pub struct DetectResult {
+  pub matched: bool,
+  pub alert: Option<Alert>,
+}
+
+/// Tracks per-template query frequency and detects N+1 patterns.
+///
+/// Unlike the Go original there is no mutex: the daemon drives `record` from a
+/// single event-loop task, so the detector is owned by exactly one actor. That
+/// single-owner assumption is what lets the mutating methods take a plain
+/// `Ref<Detector>` without locking.
+pub struct Detector {
+  threshold: int,
+  window: time.Duration,
+  cooldown: time.Duration,
+  queries: Map<string, Slice<time.Time>>,
+  last_alert: Map<string, time.Time>,
+}
+
+impl Detector {
+  /// Create a detector.
+  ///
+  /// `threshold` is the occurrence count that triggers a match (e.g. 5).
+  /// `window` is the span to count within (e.g. 1s). `cooldown` is the minimum
+  /// gap between alerts for the same template (e.g. 10s).
+  pub fn new(threshold: int, window: time.Duration, cooldown: time.Duration) -> Detector {
+    Detector { 
+      threshold,
+      window,
+      cooldown,
+      queries: Map.new(),
+      last_alert: Map.new(),
+    }
+  }
+
+  /// Register a query occurrence at time `t` and return the outcome.
+  ///
+  /// Empty queries are ignored and yield a zero result. Otherwise timestamps
+  /// older than `t - window` are evicted, `t` is appended, and the in-window
+  /// count is compared against the threshold.
+  pub fn record(self: Ref<Detector>, query: string, t: time.Time) -> DetectResult {
+    if query == "" { return DetectResult { matched: false, alert: None } }
+
+    let cutoff = t.Add(-self.window)
+
+    // Evict timestamps strictly before the cutoff, then append the new one.
+    let existing = self.queries.get(query).unwrap_or([])
+    let times = existing.filter(|ts| !ts.Before(cutoff)).append(t)
+    self.queries[query] = times
+
+    let count = times.length()
+    if count < self.threshold {
+      return DetectResult { matched: false, alert: None }
+    }
+
+    // At or above threshold: always matched, but only alert when there is no
+    // prior alert for this template or the cooldown has elapsed.
+    let should_alert = match self.last_alert.get(query) {
+      None => true,
+      Some(last) => t.Sub(last) >= self.cooldown,
+    }
+
+    if should_alert {
+      self.last_alert[query] = t
+      DetectResult { matched: true, alert: Some(Alert { query, count }) }
+    } else {
+      DetectResult { matched: true, alert: None }
+    }
+  }
+}

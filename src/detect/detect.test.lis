@@ -1,0 +1,202 @@
+import "go:time"
+
+/// Fixed base instant so every test runs against a deterministic clock.
+fn base() -> time.Time {
+  time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC)
+}
+
+fn millis(n: int) -> time.Duration {
+  (n as time.Duration) * time.Millisecond
+}
+
+#[test("stays below threshold and never alerts")]
+fn test_below_threshold() {
+  let mut d = Detector.new(5, time.Second, 10 * time.Second)
+  let now = base()
+  let q = "SELECT id, name FROM users WHERE id = $1"
+
+  for i in 0..4 {
+    let r = d.record(q, now.Add(millis(i * 100)))
+    assert !r.matched
+    assert r.alert == None
+  }
+}
+
+#[test("crosses threshold, matches and alerts with the current count")]
+fn test_at_threshold() {
+  let mut d = Detector.new(5, time.Second, 10 * time.Second)
+  let now = base()
+  let q = "SELECT id, name FROM users WHERE id = $1"
+
+  for i in 0..4 {
+    let _ = d.record(q, now.Add(millis(i * 100)))
+  }
+
+  let r = d.record(q, now.Add(millis(400)))
+  assert r.matched
+  let assert Some(alert) = r.alert
+  assert alert.count == 5
+  assert alert.query == q
+}
+
+#[test("keeps matching after threshold but cooldown suppresses further alerts")]
+fn test_matched_after_threshold() {
+  let mut d = Detector.new(5, time.Second, 10 * time.Second)
+  let now = base()
+  let q = "SELECT id, name FROM users WHERE id = $1"
+
+  // Cross the threshold.
+  for i in 0..5 {
+    let _ = d.record(q, now.Add(millis(i * 100)))
+  }
+
+  // Subsequent in-window events stay matched but the cooldown blocks alerts.
+  for i in 0..5 {
+    let r = d.record(q, now.Add(millis(500 + i * 100)))
+    assert r.matched
+    assert r.alert == None
+  }
+}
+
+#[test("timestamps outside the window are evicted before counting")]
+fn test_window_expiry() {
+  let mut d = Detector.new(5, time.Second, 10 * time.Second)
+  let now = base()
+  let q = "SELECT id, name FROM users WHERE id = $1"
+
+  // Three queries in the first batch.
+  for i in 0..3 {
+    let _ = d.record(q, now.Add(millis(i * 100)))
+  }
+
+  // Three more after the window has passed: 6 total, but only 3 in window.
+  let after = now.Add(2 * time.Second)
+  for i in 0..3 {
+    let r = d.record(q, after.Add(millis(i * 100)))
+    assert !r.matched
+  }
+}
+
+#[test("alerts again once the cooldown has elapsed")]
+fn test_cooldown_expiry() {
+  let mut d = Detector.new(5, 2 * time.Second, time.Second)
+  let now = base()
+  let q = "SELECT id, name FROM users WHERE id = $1"
+
+  // Trigger the first alert.
+  for i in 0..5 {
+    let _ = d.record(q, now.Add(millis(i * 100)))
+  }
+
+  // After the cooldown expires it should alert again.
+  let after = now.Add(millis(1500))
+  let r = d.record(q, after)
+  assert r.matched
+  let assert Some(alert) = r.alert
+  assert alert.query == q
+}
+
+#[test("templates are tracked independently")]
+fn test_different_templates() {
+  let mut d = Detector.new(3, time.Second, 10 * time.Second)
+  let now = base()
+  let q1 = "SELECT id, name FROM users WHERE id = $1"
+  let q2 = "SELECT id, title FROM posts WHERE user_id = $1"
+
+  // Interleave two of each: below threshold for both.
+  let _ = d.record(q1, now)
+  let _ = d.record(q2, now.Add(millis(100)))
+  let _ = d.record(q1, now.Add(millis(200)))
+  let _ = d.record(q2, now.Add(millis(300)))
+
+  // q1 reaches the threshold.
+  let r1 = d.record(q1, now.Add(millis(400)))
+  let assert Some(a1) = r1.alert
+  assert a1.query == q1
+
+  // q2 independently reaches the threshold.
+  let r2 = d.record(q2, now.Add(millis(500)))
+  let assert Some(a2) = r2.alert
+  assert a2.query == q2
+}
+
+#[test("empty query yields a zero result")]
+fn test_empty_query() {
+  let mut d = Detector.new(1, time.Second, 10 * time.Second)
+  let r = d.record("", base())
+  assert !r.matched
+  assert r.alert == None
+}
+
+// --- Additional edge cases beyond the Go suite ---
+
+#[test("a timestamp exactly on the cutoff is retained (eviction is strict)")]
+fn test_window_boundary_inclusive() {
+  // window = 1s, threshold = 2. Record at t0, then at t0+1s. The cutoff for
+  // the second call is exactly t0, and t0 is NOT strictly before the cutoff,
+  // so it survives and the count reaches 2.
+  let mut d = Detector.new(2, time.Second, 10 * time.Second)
+  let now = base()
+  let q = "SELECT 1"
+
+  let first = d.record(q, now)
+  assert !first.matched
+
+  let second = d.record(q, now.Add(time.Second))
+  assert second.matched
+  let assert Some(alert) = second.alert
+  assert alert.count == 2
+}
+
+#[test("a timestamp just past the cutoff is evicted")]
+fn test_window_boundary_exclusive() {
+  // Same setup but the second call lands 1ms later, pushing the cutoff past
+  // t0 so the first timestamp is dropped and the count falls back to 1.
+  let mut d = Detector.new(2, time.Second, 10 * time.Second)
+  let now = base()
+  let q = "SELECT 1"
+
+  let _ = d.record(q, now)
+  let second = d.record(q, now.Add(time.Second + millis(1)))
+  assert !second.matched
+  assert second.alert == None
+}
+
+#[test("re-alerts after cooldown then suppresses again")]
+fn test_cooldown_re_alert_cycle() {
+  // threshold 2, wide window so nothing is evicted, cooldown 1s.
+  let mut d = Detector.new(2, 10 * time.Second, time.Second)
+  let now = base()
+  let q = "SELECT 1"
+
+  let _ = d.record(q, now)
+  let alert1 = d.record(q, now.Add(millis(100)))
+  let assert Some(a1) = alert1.alert
+  assert a1.count == 2
+
+  // Still within cooldown: matched but suppressed.
+  let suppressed = d.record(q, now.Add(millis(200)))
+  assert suppressed.matched
+  assert suppressed.alert == None
+
+  // Cooldown elapsed (>= 1s since the last alert at +100ms): alert again.
+  let alert2 = d.record(q, now.Add(millis(1100)))
+  let assert Some(a2) = alert2.alert
+  assert a2.count == 4
+}
+
+#[test("exact cooldown boundary re-alerts (>= comparison)")]
+fn test_cooldown_exact_boundary() {
+  let mut d = Detector.new(2, 10 * time.Second, time.Second)
+  let now = base()
+  let q = "SELECT 1"
+
+  let _ = d.record(q, now)
+  let first = d.record(q, now.Add(millis(100)))
+  let assert Some(_) = first.alert
+
+  // Exactly one second after the previous alert: t - last == cooldown, and the
+  // comparison is >=, so this re-alerts.
+  let second = d.record(q, now.Add(millis(1100)))
+  let assert Some(_) = second.alert
+}
