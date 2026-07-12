@@ -19,18 +19,25 @@ fn ev(id: string, op: event.Op, query: string, tx: Option<string>) -> event.Even
   }
 }
 
+/// Apply one message and discard the effect (most transition tests care only
+/// about the resulting model; effect-bearing transitions are tested separately).
+fn up(m: Model, msg: Msg) -> Model {
+  let (next, _) = update(m, msg)
+  next
+}
+
 /// Feed a list of events into a fresh model via update(Incoming), as the live
 /// loop would.
 fn feed(events: Slice<event.Event>) -> Model {
   let mut m = Model.new()
   for e in events {
-    m = update(m, Msg.Incoming(e))
+    m = up(m, Msg.Incoming(e))
   }
   m
 }
 
 fn press(m: Model, key: Key) -> Model {
-  update(m, Msg.Press(key))
+  up(m, Msg.Press(key))
 }
 
 // --- follow-mode & incoming events --------------------------------------
@@ -67,7 +74,7 @@ fn test_scroll_up_disengages() {
   assert m.cursor == 1
 
   // A new event arrives; cursor must NOT jump to the bottom.
-  m = update(m, Msg.Incoming(ev("d", event.Op.Query, "SELECT 4", None)))
+  m = up(m, Msg.Incoming(ev("d", event.Op.Query, "SELECT 4", None)))
   assert !m.follow
   assert m.cursor == 1
   assert m.rows.length() == 4
@@ -102,8 +109,8 @@ fn test_pause_buffering() {
   m = press(m, Key.Char('p'))
   assert m.paused
 
-  m = update(m, Msg.Incoming(ev("b", event.Op.Query, "SELECT 2", None)))
-  m = update(m, Msg.Incoming(ev("c", event.Op.Query, "SELECT 3", None)))
+  m = up(m, Msg.Incoming(ev("b", event.Op.Query, "SELECT 2", None)))
+  m = up(m, Msg.Incoming(ev("c", event.Op.Query, "SELECT 3", None)))
   // Still only the pre-pause event is visible.
   assert m.rows.length() == 1
   assert m.buffered.length() == 2
@@ -192,12 +199,12 @@ fn test_inspect_roundtrip() {
   let assert Screen.List = m.screen
 }
 
-#[test("enter on a tx summary row stays in List (no detail yet)")]
-fn test_inspect_summary_noop() {
+#[test("enter on a tx summary row opens Inspect with tx detail")]
+fn test_inspect_summary() {
   let mut m = tx_model()
   m = Model { cursor: 1, follow: false, ..m } // summary row
   m = press(m, Key.Enter)
-  let assert Screen.List = m.screen
+  let assert Screen.Inspect = m.screen
 }
 
 #[test("cursor_event returns the event on an event row, None on a summary")]

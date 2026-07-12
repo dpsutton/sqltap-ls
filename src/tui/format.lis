@@ -25,6 +25,11 @@ pub fn clock(t: time.Time) -> string {
   t.In(time.Local).Format("15:04:05.000")
 }
 
+/// HH:MM:SS in local time, matching the Go inspector's formatTimeFull.
+pub fn clock_full(t: time.Time) -> string {
+  t.In(time.Local).Format("15:04:05")
+}
+
 /// Collapse runs of whitespace, then truncate to `max_len` runes with an
 /// ellipsis. Mirrors the Go `truncate` helper (rune-aware here).
 pub fn truncate(s: string, max_len: int) -> string {

@@ -1,0 +1,475 @@
+import "go:time"
+import "go:strings"
+import "event"
+
+// --- fixtures ------------------------------------------------------------
+
+fn gev(id: string, op: event.Op, query: string, dur: time.Duration, tx: Option<string>) -> event.Event {
+  event.Event {
+    id,
+    op,
+    query,
+    args: [],
+    start_time: time.Date(2026, time.July, 12, 10, 0, 0, 0, time.UTC),
+    duration: dur,
+    outcome: event.Outcome.Ok { rows_affected: 1 },
+    tx_id: tx,
+    nplus1: false,
+    slow: false,
+    normalized_query: query,
+  }
+}
+
+fn flag_ev(id: string, query: string, nplus1: bool, slow: bool) -> event.Event {
+  event.Event {
+    id,
+    op: event.Op.Query,
+    query,
+    args: [],
+    start_time: time.Date(2026, time.July, 12, 10, 0, 0, 0, time.UTC),
+    duration: 5 * time.Millisecond,
+    outcome: event.Outcome.Ok { rows_affected: 1 },
+    tx_id: None,
+    nplus1,
+    slow,
+    normalized_query: query,
+  }
+}
+
+fn feed_events(events: Slice<event.Event>) -> Model {
+  let mut m = Model.new()
+  for e in events {
+    m = up(m, Msg.Incoming(e))
+  }
+  m
+}
+
+fn type_str(m: Model, s: string) -> Model {
+  let mut model = Model { ..m }
+  for r in s.runes() {
+    model = up(model, Msg.Press(Key.Char(r)))
+  }
+  model
+}
+
+fn strip(s: string) -> string {
+  let esc = esc_rune()
+  let mut out = ""
+  let mut in_escape = false
+  for r in s.runes() {
+    if in_escape {
+      if r == 'm' {
+        in_escape = false
+      }
+    } else if r == esc {
+      in_escape = true
+    } else {
+      out += r as string
+    }
+  }
+  out
+}
+
+// --- search editing ------------------------------------------------------
+
+#[test("tui: slash opens search input, typing filters, esc cancels")]
+fn test_search_edit() {
+  let mut m = feed_events([
+    gev("a", event.Op.Query, "SELECT * FROM users", 1 * time.Millisecond, None),
+    gev("b", event.Op.Query, "SELECT * FROM orders", 1 * time.Millisecond, None),
+  ])
+  m = up(m, Msg.Press(Key.Char('/')))
+  assert m.search.active
+  m = type_str(m, "users")
+  assert m.search.text == "users"
+  // Only the matching event remains in the flat filtered list.
+  assert m.rows.length() == 1
+  // esc clears and restores.
+  m = up(m, Msg.Press(Key.Esc))
+  assert !m.search.active
+  assert m.search.text == ""
+  assert m.rows.length() == 2
+}
+
+#[test("tui: search backspace and cursor editing")]
+fn test_search_backspace() {
+  let mut m = feed_events([gev("a", event.Op.Query, "SELECT 1", 1 * time.Millisecond, None)])
+  m = up(m, Msg.Press(Key.Char('/')))
+  m = type_str(m, "abc")
+  assert m.search.cursor == 3
+  m = up(m, Msg.Press(Key.Left))
+  assert m.search.cursor == 2
+  m = up(m, Msg.Press(Key.Backspace))
+  assert m.search.text == "ac"
+  assert m.search.cursor == 1
+}
+
+#[test("tui: search enter accepts and keeps the query")]
+fn test_search_accept() {
+  let mut m = feed_events([
+    gev("a", event.Op.Query, "SELECT users", 1 * time.Millisecond, None),
+    gev("b", event.Op.Query, "SELECT orders", 1 * time.Millisecond, None),
+  ])
+  m = up(m, Msg.Press(Key.Char('/')))
+  m = type_str(m, "orders")
+  m = up(m, Msg.Press(Key.Enter))
+  assert !m.search.active
+  assert m.search.text == "orders"
+  assert m.rows.length() == 1
+}
+
+// --- filter apply --------------------------------------------------------
+
+#[test("tui: filter f applies a duration token")]
+fn test_filter_apply() {
+  let mut m = feed_events([
+    gev("fast", event.Op.Query, "SELECT 1", 1 * time.Millisecond, None),
+    gev("slow", event.Op.Query, "SELECT 2", 200 * time.Millisecond, None),
+  ])
+  m = up(m, Msg.Press(Key.Char('f')))
+  assert m.filter.active
+  m = type_str(m, "d>100ms")
+  m = up(m, Msg.Press(Key.Enter))
+  assert m.filter.text == "d>100ms"
+  assert m.rows.length() == 1
+  let assert Row.Event { idx } = m.rows[0]
+  assert m.events[idx].id == "slow"
+}
+
+// --- sort toggle ---------------------------------------------------------
+
+#[test("tui: s toggles duration sort (flat, slowest first) and disengages follow")]
+fn test_sort_toggle() {
+  let mut m = feed_events([
+    gev("a", event.Op.Query, "SELECT 1", 10 * time.Millisecond, None),
+    gev("b", event.Op.Query, "SELECT 2", 300 * time.Millisecond, None),
+    gev("c", event.Op.Query, "SELECT 3", 50 * time.Millisecond, None),
+  ])
+  m = up(m, Msg.Press(Key.Char('s')))
+  let assert SortMode.Duration = m.sort
+  assert !m.follow
+  // Slowest first: b (300), c (50), a (10).
+  let assert Row.Event { idx: i0 } = m.rows[0]
+  let assert Row.Event { idx: i2 } = m.rows[2]
+  assert m.events[i0].id == "b"
+  assert m.events[i2].id == "a"
+  // Toggling back returns to chronological.
+  m = up(m, Msg.Press(Key.Char('s')))
+  let assert SortMode.Chronological = m.sort
+}
+
+#[test("tui: duration sort flattens transactions")]
+fn test_sort_flattens_tx() {
+  let mut m = feed_events([
+    gev("bg", event.Op.Begin, "BEGIN", 1 * time.Millisecond, Some("t1")),
+    gev("q1", event.Op.Query, "SELECT a", 1 * time.Millisecond, Some("t1")),
+    gev("cm", event.Op.Commit, "COMMIT", 1 * time.Millisecond, Some("t1")),
+  ])
+  // Chronological has a summary row.
+  assert m.rows[0].is_summary()
+  m = up(m, Msg.Press(Key.Char('s')))
+  // Flat: no summary rows.
+  for r in m.rows {
+    assert !r.is_summary()
+  }
+}
+
+// --- tx coloring ----------------------------------------------------------
+
+#[test("tui: transactions get cycling colors from the palette")]
+fn test_tx_colors() {
+  let m = feed_events([
+    gev("b1", event.Op.Begin, "BEGIN", 1 * time.Millisecond, Some("t1")),
+    gev("c1", event.Op.Commit, "COMMIT", 1 * time.Millisecond, Some("t1")),
+    gev("b2", event.Op.Begin, "BEGIN", 1 * time.Millisecond, Some("t2")),
+    gev("c2", event.Op.Commit, "COMMIT", 1 * time.Millisecond, Some("t2")),
+  ])
+  assert m.tx_color("t1") == "6"
+  assert m.tx_color("t2") == "3"
+}
+
+// --- explain result handling ---------------------------------------------
+
+#[test("tui: x opens explain (running), explain result posts the plan")]
+fn test_explain_result() {
+  let m0 = feed_events([gev("a", event.Op.Query, "SELECT 1", 1 * time.Millisecond, None)])
+  let (opened, effect) = update(m0, Msg.Press(Key.Char('x')))
+  let assert Screen.Explain = opened.screen
+  let assert ExplainState.Running = opened.explain
+  let assert Effect.RunExplain { .. } = effect
+  let m = up(opened, Msg.ExplainResult { plan: Some("Seq Scan on users"), error: None })
+  let assert ExplainState.Plan { text: "Seq Scan on users" } = m.explain
+}
+
+#[test("tui: explain result carrying an error stores the failure")]
+fn test_explain_error() {
+  let mut m = feed_events([gev("a", event.Op.Query, "SELECT 1", 1 * time.Millisecond, None)])
+  m = up(m, Msg.Press(Key.Char('X')))
+  let assert ExplainKind.Analyze = m.explain_kind
+  m = up(m, Msg.ExplainResult { plan: None, error: Some("boom") })
+  let assert ExplainState.Failed { message: "boom" } = m.explain
+}
+
+#[test("tui: explain is refused on a non-query op")]
+fn test_explain_refused() {
+  let mut m = feed_events([gev("b", event.Op.Begin, "BEGIN", 1 * time.Millisecond, Some("t1"))])
+  // cursor is on the tx summary; move onto the begin event is not possible via
+  // summary. Instead feed a standalone non-query op.
+  m = feed_events([gev("p", event.Op.Prepare, "PREPARE x", 1 * time.Millisecond, None)])
+  let (_, effect) = update(m, Msg.Press(Key.Char('x')))
+  let assert Effect.Nothing = effect
+}
+
+// --- editor result --------------------------------------------------------
+
+#[test("tui: editor result with a query re-runs explain")]
+fn test_editor_result() {
+  let m0 = feed_events([gev("a", event.Op.Query, "SELECT 1", 1 * time.Millisecond, None)])
+  let (m, effect) = update(m0, Msg.EditorResult {
+    query: Some("SELECT 2"),
+    args: [],
+    kind: ExplainKind.Explain,
+    error: None,
+  })
+  let assert Screen.Explain = m.screen
+  assert m.explain_query == "SELECT 2"
+  let assert Effect.RunExplain { .. } = effect
+}
+
+#[test("tui: editor result with empty query cancels")]
+fn test_editor_cancel() {
+  let mut m = feed_events([gev("a", event.Op.Query, "SELECT 1", 1 * time.Millisecond, None)])
+  let (m2, effect) = update(m, Msg.EditorResult { query: None, args: [], kind: ExplainKind.Explain, error: None })
+  let assert Screen.List = m2.screen
+  let assert Effect.Nothing = effect
+}
+
+// --- copy ----------------------------------------------------------------
+
+#[test("tui: c copies the query and shows an alert")]
+fn test_copy() {
+  let mut m = feed_events([gev("a", event.Op.Query, "SELECT 1", 1 * time.Millisecond, None)])
+  let (m2, effect) = update(m, Msg.Press(Key.Char('c')))
+  assert m2.alert == "copied!"
+  let assert Effect.CopyText { text: "SELECT 1" } = effect
+}
+
+// --- alerts + seq guard ---------------------------------------------------
+
+#[test("tui: n+1 event triggers an alert with truncated query text")]
+fn test_nplus1_alert() {
+  let mut m = Model.new()
+  let (m2, effect) = update(m, Msg.Incoming(flag_ev("n1", "SELECT * FROM users WHERE id = 1", true, false)))
+  assert strings.HasPrefix(m2.alert, "N+1 detected: ")
+  let assert Effect.Alert { .. } = effect
+}
+
+#[test("tui: slow event alert says Slow query")]
+fn test_slow_alert() {
+  let mut m = Model.new()
+  let (m2, _) = update(m, Msg.Incoming(flag_ev("s1", "SELECT slow", false, true)))
+  assert strings.HasPrefix(m2.alert, "Slow query: ")
+}
+
+#[test("tui: ClearAlert only clears when the seq matches (guarded)")]
+fn test_alert_seq_guard() {
+  let (started, _) = update(Model.new(), Msg.Incoming(flag_ev("n1", "q", true, false)))
+  let seq = started.alert_seq
+  // A stale ClearAlert (older seq) does not clear.
+  let mut m = up(started, Msg.ClearAlert { seq: seq - 1 })
+  assert m.alert != ""
+  // The matching ClearAlert clears.
+  m = up(m, Msg.ClearAlert { seq })
+  assert m.alert == ""
+}
+
+#[test("tui: alert text truncates long queries to 60 chars")]
+fn test_alert_truncation() {
+  let long = strings.Repeat("x", 100)
+  let mut m = Model.new()
+  let (m2, _) = update(m, Msg.Incoming(flag_ev("n1", long, true, false)))
+  // "N+1 detected: " + 57 chars + "..."
+  assert strings.Contains(m2.alert, "...")
+  assert !strings.Contains(m2.alert, strings.Repeat("x", 61))
+}
+
+// --- analytics build + sort ----------------------------------------------
+
+#[test("tui: a enters analytics with grouped rows")]
+fn test_analytics_enter() {
+  let mut m = feed_events([
+    gev("a", event.Op.Query, "SELECT 1", 10 * time.Millisecond, None),
+    gev("b", event.Op.Query, "SELECT 1", 20 * time.Millisecond, None),
+    gev("c", event.Op.Query, "SELECT 2", 5 * time.Millisecond, None),
+  ])
+  m = up(m, Msg.Press(Key.Char('a')))
+  let assert Screen.Analytics = m.screen
+  assert m.analytics.length() == 2
+  // Default sort is total desc: SELECT 1 (30ms total) first.
+  assert m.analytics[0].count == 2
+}
+
+#[test("tui: analytics s cycles the sort mode")]
+fn test_analytics_sort_cycle() {
+  let mut m = feed_events([gev("a", event.Op.Query, "SELECT 1", 10 * time.Millisecond, None)])
+  m = up(m, Msg.Press(Key.Char('a')))
+  let assert AnalyticsSort.Total = m.analytics_sort
+  m = up(m, Msg.Press(Key.Char('s')))
+  let assert AnalyticsSort.Count = m.analytics_sort
+  m = up(m, Msg.Press(Key.Char('s')))
+  let assert AnalyticsSort.Avg = m.analytics_sort
+  m = up(m, Msg.Press(Key.Char('s')))
+  let assert AnalyticsSort.P95 = m.analytics_sort
+  m = up(m, Msg.Press(Key.Char('s')))
+  let assert AnalyticsSort.Total = m.analytics_sort
+}
+
+#[test("tui: analytics q returns to list")]
+fn test_analytics_back() {
+  let mut m = feed_events([gev("a", event.Op.Query, "SELECT 1", 10 * time.Millisecond, None)])
+  m = up(m, Msg.Press(Key.Char('a')))
+  m = up(m, Msg.Press(Key.Char('q')))
+  let assert Screen.List = m.screen
+}
+
+// --- percentile edge cases -----------------------------------------------
+
+#[test("tui: percentile handles empty, single, and multi slices")]
+fn test_percentile() {
+  let empty: Slice<time.Duration> = []
+  assert percentile(empty, 0.95) == 0 as time.Duration
+  let one = [42 as time.Duration]
+  assert percentile(one, 0.95) == 42 as time.Duration
+  // 20 elements: idx = int(19 * 0.95) = int(18.05) = 18 -> value 19 (0-based).
+  let mut many: Slice<time.Duration> = []
+  let mut i = 0
+  while i < 20 {
+    many = many.append((i + 1) as time.Duration)
+    i += 1
+  }
+  assert percentile(many, 0.95) == 19 as time.Duration
+}
+
+// --- timeline ------------------------------------------------------------
+
+#[test("tui: t enters timeline, q returns")]
+fn test_timeline_nav() {
+  let mut m = feed_events([gev("a", event.Op.Query, "SELECT 1", 10 * time.Millisecond, None)])
+  m = up(m, Msg.Press(Key.Char('t')))
+  let assert Screen.Timeline = m.screen
+  m = up(m, Msg.Press(Key.Char('q')))
+  let assert Screen.List = m.screen
+}
+
+#[test("tui: timeline_events selects only query ops")]
+fn test_timeline_events() {
+  let m = feed_events([
+    gev("q", event.Op.Query, "SELECT 1", 10 * time.Millisecond, None),
+    gev("p", event.Op.Prepare, "PREPARE", 1 * time.Millisecond, None),
+    gev("e", event.Op.Exec, "UPDATE t", 5 * time.Millisecond, None),
+  ])
+  assert timeline_events(m).length() == 2
+}
+
+// --- resize --------------------------------------------------------------
+
+#[test("tui: Resized updates model width and height")]
+fn test_resize() {
+  let m = Model.new()
+  let (m2, _) = update(m, Msg.Resized { width: 120, height: 40 })
+  assert m2.width == 120
+  assert m2.height == 40
+}
+
+// --- export effect --------------------------------------------------------
+
+#[test("tui: w then j issues a JSON export effect")]
+fn test_write_effect() {
+  let mut m = feed_events([gev("a", event.Op.Query, "SELECT 1", 1 * time.Millisecond, None)])
+  m = up(m, Msg.Press(Key.Char('w')))
+  assert m.write_mode
+  let (m2, effect) = update(m, Msg.Press(Key.Char('j')))
+  assert !m2.write_mode
+  let assert Effect.RunExport { format: ExportFormat.Json, .. } = effect
+}
+
+// --- view smoke tests for new screens -------------------------------------
+
+#[test("tui: explain view shows title and running state")]
+fn test_explain_view() {
+  let mut m = feed_events([gev("a", event.Op.Query, "SELECT 1", 1 * time.Millisecond, None)])
+  m = up(m, Msg.Press(Key.Char('x')))
+  let frame = strip(view(m, 100, 24))
+  assert frame.contains("EXPLAIN")
+  assert frame.contains("Running")
+  m = up(m, Msg.ExplainResult { plan: Some("Seq Scan on users  (cost=0.00)"), error: None })
+  let frame2 = strip(view(m, 100, 24))
+  assert frame2.contains("Seq Scan")
+}
+
+#[test("tui: analytics view shows template count and sort")]
+fn test_analytics_view() {
+  let mut m = feed_events([
+    gev("a", event.Op.Query, "SELECT 1", 10 * time.Millisecond, None),
+    gev("b", event.Op.Query, "SELECT 1", 20 * time.Millisecond, None),
+  ])
+  m = up(m, Msg.Press(Key.Char('a')))
+  let frame = strip(view(m, 100, 24))
+  assert frame.contains("Analytics")
+  assert frame.contains("templates")
+  assert frame.contains("sort: total")
+  assert frame.contains("Count")
+}
+
+#[test("tui: timeline view shows query count and axis")]
+fn test_timeline_view() {
+  let mut m = feed_events([
+    gev("a", event.Op.Query, "SELECT 1", 10 * time.Millisecond, None),
+    gev("b", event.Op.Query, "SELECT 2", 20 * time.Millisecond, None),
+  ])
+  m = up(m, Msg.Press(Key.Char('t')))
+  let frame = strip(view(m, 100, 24))
+  assert frame.contains("Timeline")
+  assert frame.contains("2 queries")
+}
+
+#[test("tui: filtered list title shows matched/total and footer shows filter")]
+fn test_filter_footer() {
+  let mut m = feed_events([
+    gev("a", event.Op.Query, "SELECT users", 1 * time.Millisecond, None),
+    gev("b", event.Op.Query, "SELECT orders", 1 * time.Millisecond, None),
+  ])
+  m = up(m, Msg.Press(Key.Char('f')))
+  m = type_str(m, "op:select")
+  m = up(m, Msg.Press(Key.Enter))
+  let frame = strip(view(m, 120, 24))
+  assert frame.contains("[filter: op:select]")
+  assert frame.contains("esc: clear")
+}
+
+#[test("tui: alert overlay renders over the list frame")]
+fn test_alert_overlay() {
+  let mut m = Model.new()
+  let (m2, _) = update(m, Msg.Incoming(flag_ev("n1", "SELECT x", true, false)))
+  let frame = strip(view(m2, 100, 24))
+  assert frame.contains("N+1 detected")
+}
+
+// --- page scroll ----------------------------------------------------------
+
+#[test("tui: ctrl+d half-page scrolls down and re-engages follow at bottom")]
+fn test_page_scroll() {
+  let mut events: Slice<event.Event> = []
+  let mut i = 0
+  while i < 50 {
+    events = events.append(gev(f"e{i}", event.Op.Query, "SELECT 1", 1 * time.Millisecond, None))
+    i += 1
+  }
+  let mut m = feed_events(events)
+  // Scroll up first to disengage follow.
+  m = up(m, Msg.Press(Key.CtrlU))
+  assert !m.follow
+  let before = m.cursor
+  m = up(m, Msg.Press(Key.CtrlD))
+  assert m.cursor > before
+}

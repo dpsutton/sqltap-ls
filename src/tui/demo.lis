@@ -37,7 +37,7 @@ pub fn demo() {
   // Fake traffic generator, cancelled with the context.
   task feed_fake_events(ctx, events)
 
-  run(ctx, events, keys, term)
+  run(ctx, "localhost:9091", events, keys, term)
 }
 
 /// Emit a repeating cycle of synthetic events (a couple of standalone queries

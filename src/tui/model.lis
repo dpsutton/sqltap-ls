@@ -1,11 +1,52 @@
+import "go:time"
 import "event"
 
-/// Which screen is showing. List is the live traffic view; Inspect is the
-/// full-detail drill-down for one event. The full TUI will add Explain,
-/// Analytics, and Timeline variants here — the enum is the extension point.
+/// Which screen is showing. List is the live traffic view; the others are
+/// full-screen drill-downs reached from the list (and each other). The enum is
+/// the single view-transition extension point.
 pub enum Screen {
   List,
   Inspect,
+  Explain,
+  Analytics,
+  Timeline,
+}
+
+/// Chronological (arrival order, tx-grouped) vs slowest-first (flat) sorting.
+pub enum SortMode {
+  Chronological,
+  Duration,
+}
+
+/// The EXPLAIN plan state for the Explain screen. Running until a result posts
+/// back; then either the plan text or an error. Modeled as a sum type so the
+/// three states are exclusive (no plan-string-beside-error-beside-loading-flag).
+pub enum ExplainState {
+  Running,
+  Plan { text: string },
+  Failed { message: string },
+}
+
+/// EXPLAIN vs EXPLAIN ANALYZE — chosen by lowercase/uppercase key.
+pub enum ExplainKind {
+  Explain,
+  Analyze,
+}
+
+impl ExplainKind {
+  pub fn title(self) -> string {
+    match self {
+      ExplainKind.Explain => "EXPLAIN",
+      ExplainKind.Analyze => "EXPLAIN ANALYZE",
+    }
+  }
+
+  pub fn analyze(self) -> bool {
+    match self {
+      ExplainKind.Explain => false,
+      ExplainKind.Analyze => true,
+    }
+  }
 }
 
 /// One visible line in the list. A plain event, or a transaction summary that
@@ -22,41 +63,136 @@ impl Row {
   }
 }
 
-/// The complete UI state. Pure data: every field either always exists with the
-/// same meaning (identity) or is a small mode flag — nothing here is IO. The
-/// list of collapsed tx ids and the paused buffer are the only "hidden" state;
-/// both are plain and testable.
+/// A one-line text input with a rune cursor. Backs both search (`/`) and filter
+/// (`f`) editing; `active` distinguishes editing-mode from an applied value.
+pub struct Input {
+  pub text: string,
+  pub cursor: int,
+  pub active: bool,
+}
+
+impl Input {
+  pub fn empty() -> Input {
+    Input { text: "", cursor: 0, active: false }
+  }
+}
+
+/// The complete UI state. Pure data: no IO. Screen-specific scroll offsets and
+/// the explain-plan state live here so `view` and `update` stay pure and the
+/// whole machine is exercisable without a terminal.
 pub struct Model {
   pub events: Slice<event.Event>,
   pub cursor: int,
   pub follow: bool,
   pub paused: bool,
+  pub width: int,
+  pub height: int,
   pub collapsed: Slice<string>,
   pub buffered: Slice<event.Event>,
   pub screen: Screen,
   pub rows: Slice<Row>,
+  pub tx_colors: Slice<TxColor>,
+
+  pub search: Input,
+  pub filter: Input,
+  pub sort: SortMode,
+
+  pub write_mode: bool,
+  pub alert: string,
+  pub alert_seq: int,
+
+  pub inspect_scroll: int,
+
+  pub explain: ExplainState,
+  pub explain_kind: ExplainKind,
+  pub explain_query: string,
+  pub explain_args: Slice<string>,
+  pub explain_scroll: int,
+  pub explain_hscroll: int,
+
+  pub analytics: Slice<AnalyticsRow>,
+  pub analytics_cursor: int,
+  pub analytics_hscroll: int,
+  pub analytics_sort: AnalyticsSort,
+
+  pub timeline_scroll: int,
+}
+
+/// A tx id paired with the ANSI color assigned to it, in assignment order.
+pub struct TxColor {
+  pub tx_id: string,
+  pub color: string,
 }
 
 /// A message driving one `update` step. Events arrive from the traffic
-/// receiver, keys from the input decoder; both are values, so the whole state
-/// machine is exercisable without a terminal.
+/// receiver, keys from the input decoder, results from spawned effect tasks;
+/// all are values, so the whole state machine is exercisable without IO.
 pub enum Msg {
   Incoming(event.Event),
   Press(Key),
+  Resized { width: int, height: int },
+  ExplainResult { plan: Option<string>, error: Option<string> },
+  EditorResult { query: Option<string>, args: Slice<string>, kind: ExplainKind, error: Option<string> },
+  ExportResult { path: Option<string>, error: Option<string> },
+  ClearAlert { seq: int },
+}
+
+/// A side effect the run loop must perform after an update, plus the model that
+/// reflects the state change. `update` is pure — it names the effect; the loop
+/// (run.lis) executes it and posts the resulting Msg back to the inbox.
+pub enum Effect {
+  Nothing,
+  Quit,
+  RunExplain { kind: ExplainKind, query: string, args: Slice<string> },
+  OpenEditor { kind: ExplainKind, query: string, args: Slice<string> },
+  RunExport { format: ExportFormat, events: Slice<event.Event>, filter: string, search: string },
+  CopyText { text: string },
+  Alert { seq: int },
+}
+
+// The tx color cycle, matching Go's txColors = {"6","3","5","2","4","1"}.
+fn tx_color_cycle() -> Slice<string> {
+  ["6", "3", "5", "2", "4", "1"]
+}
+
+// The alert lifetime before a ClearAlert timer fires.
+pub fn alert_duration() -> time.Duration {
+  3 * time.Second
 }
 
 impl Model {
-  /// A fresh List model, following the tail, unpaused.
+  /// A fresh List model, following the tail, unpaused, chronological.
   pub fn new() -> Model {
     Model {
       events: [],
       cursor: 0,
       follow: true,
       paused: false,
+      width: 80,
+      height: 24,
       collapsed: [],
       buffered: [],
       screen: Screen.List,
       rows: [],
+      tx_colors: [],
+      search: Input.empty(),
+      filter: Input.empty(),
+      sort: SortMode.Chronological,
+      write_mode: false,
+      alert: "",
+      alert_seq: 0,
+      inspect_scroll: 0,
+      explain: ExplainState.Running,
+      explain_kind: ExplainKind.Explain,
+      explain_query: "",
+      explain_args: [],
+      explain_scroll: 0,
+      explain_hscroll: 0,
+      analytics: [],
+      analytics_cursor: 0,
+      analytics_hscroll: 0,
+      analytics_sort: AnalyticsSort.Total,
+      timeline_scroll: 0,
     }
   }
 
@@ -64,8 +200,23 @@ impl Model {
     self.collapsed.contains(tx_id)
   }
 
-  /// The event under the cursor, if the cursor is on an event row (not a tx
-  /// summary and not out of range).
+  /// The color assigned to `tx_id`, or empty if none.
+  pub fn tx_color(self, tx_id: string) -> string {
+    self.tx_colors.find(|c| c.tx_id == tx_id).map_or("", |c| c.color)
+  }
+
+  /// True while any input is being edited or the write menu is open — the modes
+  /// that swallow list keybindings.
+  fn in_input_mode(self) -> bool {
+    self.search.active || self.filter.active || self.write_mode
+  }
+
+  /// True when a filter or search is applied (flat list, no tx grouping).
+  fn filtering(self) -> bool {
+    self.filter.text != "" || self.search.text != ""
+  }
+
+  /// The event under the cursor, if the cursor is on an event row.
   pub fn cursor_event(self) -> Option<event.Event> {
     if self.cursor < 0 || self.cursor >= self.rows.length() {
       return None
@@ -76,8 +227,7 @@ impl Model {
     }
   }
 
-  /// The tx id associated with the cursor row (summary row, or an event that
-  /// belongs to a transaction), if any.
+  /// The tx id associated with the cursor row, if any.
   fn cursor_tx_id(self) -> Option<string> {
     if self.cursor < 0 || self.cursor >= self.rows.length() {
       return None
@@ -87,55 +237,238 @@ impl Model {
       Row.Event { idx } => self.events[idx].tx_id,
     }
   }
+
+  /// True when the display row at `i` is an event belonging to a transaction.
+  pub fn is_tx_child(self, i: int) -> bool {
+    if i < 0 || i >= self.rows.length() {
+      return false
+    }
+    match self.rows[i] {
+      Row.Event { idx } => self.events[idx].tx_id.is_some(),
+      Row.TxSummary { .. } => false,
+    }
+  }
+
+  /// The list-box height (in rows) given how many footer lines the frame uses.
+  /// Ported from Go's listHeight (12 = header + preview + footer + padding).
+  pub fn list_height(self, footer_lines: int) -> int {
+    let extra = max_int(footer_lines - 1, 0)
+    max_int(self.height - 12 - extra, 3)
+  }
 }
 
-/// The pure transition function: fold a message into a new model. All list
-/// navigation, follow-mode, pause buffering, and tx collapse logic lives here
-/// and nowhere else, so unit tests drive it directly.
-pub fn update(model: Model, msg: Msg) -> Model {
+/// The pure transition function. Returns the new model AND the effect the run
+/// loop should perform. All navigation, mode, and screen logic lives here.
+pub fn update(model: Model, msg: Msg) -> (Model, Effect) {
   match msg {
     Msg.Incoming(ev) => on_event(model, ev),
-    Msg.Press(key) => on_key(model, key),
+    Msg.Press(key) => on_key(clear_alert_text(model), key),
+    Msg.Resized { width, height } => (Model { width, height, ..model }, Effect.Nothing),
+    Msg.ExplainResult { plan, error } => (on_explain_result(model, plan, error), Effect.Nothing),
+    Msg.EditorResult { query, args, kind, error } => on_editor_result(model, query, args, kind, error),
+    Msg.ExportResult { path, error } => on_export_result(model, path, error),
+    Msg.ClearAlert { seq } => (on_clear_alert(model, seq), Effect.Nothing),
   }
 }
 
-fn on_event(model: Model, ev: event.Event) -> Model {
+// Clear the transient alert on any keypress (Go clears m.wroteMessage on KeyMsg).
+fn clear_alert_text(model: Model) -> Model {
+  Model { alert: "", ..model }
+}
+
+fn on_event(model: Model, ev: event.Event) -> (Model, Effect) {
   if model.paused {
-    // Hold new traffic aside; it lands when the user unpauses.
-    return Model { buffered: model.buffered.append(ev), ..model }
+    return (Model { buffered: model.buffered.append(ev), ..model }, Effect.Nothing)
   }
   let events = model.events.append(ev)
-  let rebuilt = rebuild(Model { events, ..model })
-  stick_to_tail(rebuilt)
+  let with_events = Model { events, ..model }
+
+  if ev.nplus1 || ev.slow {
+    let (alerted, seq) = show_alert(with_events, alert_label(ev))
+    if !is_list(alerted.screen) {
+      return (alerted, Effect.Alert { seq })
+    }
+    let rebuilt = stick_to_tail_if_following(rebuild(alerted))
+    return (rebuilt, Effect.Alert { seq })
+  }
+
+  if !is_list(with_events.screen) {
+    return (with_events, Effect.Nothing)
+  }
+  (stick_to_tail_if_following(rebuild(with_events)), Effect.Nothing)
 }
 
-fn on_key(model: Model, key: Key) -> Model {
+fn alert_label(ev: event.Event) -> string {
+  let q = truncate_alert(ev.query)
+  if ev.slow && !ev.nplus1 {
+    f"Slow query: {q}"
+  } else {
+    f"N+1 detected: {q}"
+  }
+}
+
+fn truncate_alert(q: string) -> string {
+  let runes = q.runes()
+  if runes.length() > 60 {
+    runes_prefix(runes, 57) + "..."
+  } else {
+    q
+  }
+}
+
+fn runes_prefix(runes: Slice<rune>, n: int) -> string {
+  let mut out = ""
+  let mut i = 0
+  while i < n && i < runes.length() {
+    out += runes[i] as string
+    i += 1
+  }
+  out
+}
+
+fn is_list(screen: Screen) -> bool {
+  match screen { Screen.List => true, _ => false }
+}
+
+fn stick_to_tail_if_following(model: Model) -> Model {
+  if model.follow {
+    Model { cursor: max_int(model.rows.length() - 1, 0), ..model }
+  } else {
+    Model { cursor: min_int(model.cursor, max_int(model.rows.length() - 1, 0)), ..model }
+  }
+}
+
+// --- explain / editor / export / alert result handling -------------------
+
+fn on_explain_result(model: Model, plan: Option<string>, error: Option<string>) -> Model {
+  let state = match error {
+    Some(msg) => ExplainState.Failed { message: msg },
+    None => ExplainState.Plan { text: plan.unwrap_or("") },
+  }
+  Model { explain: state, ..model }
+}
+
+fn on_editor_result(
+  model: Model,
+  query: Option<string>,
+  args: Slice<string>,
+  kind: ExplainKind,
+  error: Option<string>,
+) -> (Model, Effect) {
+  match error {
+    Some(msg) => {
+      let m = Model {
+        screen: Screen.Explain,
+        explain: ExplainState.Failed { message: msg },
+        explain_kind: kind,
+        explain_scroll: 0,
+        explain_hscroll: 0,
+        ..model
+      }
+      (m, Effect.Nothing)
+    },
+    None => {
+      let Some(q) = query else {
+        return (model, Effect.Nothing) // canceled (empty file)
+      }
+      if q == "" {
+        return (model, Effect.Nothing)
+      }
+      let m = Model {
+        screen: Screen.Explain,
+        explain: ExplainState.Running,
+        explain_kind: kind,
+        explain_query: q,
+        explain_args: args,
+        explain_scroll: 0,
+        explain_hscroll: 0,
+        ..model
+      }
+      (m, Effect.RunExplain { kind, query: q, args })
+    },
+  }
+}
+
+fn on_export_result(model: Model, path: Option<string>, error: Option<string>) -> (Model, Effect) {
+  let msg = match error {
+    Some(e) => f"write error: {e}",
+    None => {
+      let p = path.unwrap_or("")
+      f"wrote: ./{p}"
+    },
+  }
+  let (m, seq) = show_alert(model, msg)
+  (m, Effect.Alert { seq })
+}
+
+fn on_clear_alert(model: Model, seq: int) -> Model {
+  if seq == model.alert_seq {
+    Model { alert: "", ..model }
+  } else {
+    model
+  }
+}
+
+// Bump the alert sequence and set the message; the caller issues Effect.Alert.
+fn show_alert(model: Model, msg: string) -> (Model, int) {
+  let seq = model.alert_seq + 1
+  (Model { alert: msg, alert_seq: seq, ..model }, seq)
+}
+
+// --- key dispatch --------------------------------------------------------
+
+fn on_key(model: Model, key: Key) -> (Model, Effect) {
   match model.screen {
-    Screen.Inspect => on_key_inspect(model, key),
     Screen.List => on_key_list(model, key),
+    Screen.Inspect => on_key_inspect(model, key),
+    Screen.Explain => on_key_explain(model, key),
+    Screen.Analytics => on_key_analytics(model, key),
+    Screen.Timeline => on_key_timeline(model, key),
   }
 }
 
-fn on_key_inspect(model: Model, key: Key) -> Model {
-  match key {
-    Key.Char('q') | Key.Esc => Model { screen: Screen.List, ..model },
-    _ => model,
-  }
+fn no_effect(model: Model) -> (Model, Effect) {
+  (model, Effect.Nothing)
 }
 
-fn on_key_list(model: Model, key: Key) -> Model {
+// --- list ----------------------------------------------------------------
+
+fn on_key_list(model: Model, key: Key) -> (Model, Effect) {
+  if model.search.active {
+    return update_search(model, key)
+  }
+  if model.filter.active {
+    return update_filter(model, key)
+  }
+  if model.write_mode {
+    return update_write(model, key)
+  }
+
   match key {
-    Key.Char('j') | Key.Down => nav_down(model),
-    Key.Char('k') | Key.Up => nav_up(model),
-    Key.PgDown | Key.CtrlD => page(model, true),
-    Key.PgUp | Key.CtrlU => page(model, false),
-    Key.Char('g') => go_top(model),
-    Key.Char('G') => go_bottom(model),
-    Key.Space => toggle_tx(model),
-    Key.Enter => enter_inspect(model),
-    Key.Char('p') => toggle_pause(model),
-    Key.CtrlL => clear(model),
-    _ => model,
+    Key.CtrlC => (model, Effect.Quit),
+    Key.Char('q') => (model, Effect.Quit),
+    Key.Enter => no_effect(enter_inspect(model)),
+    Key.Char('x') => start_explain(model, ExplainKind.Explain),
+    Key.Char('X') => start_explain(model, ExplainKind.Analyze),
+    Key.Char('e') => start_edit_explain(model, ExplainKind.Explain),
+    Key.Char('E') => start_edit_explain(model, ExplainKind.Analyze),
+    Key.Char('c') => copy_query(model, false),
+    Key.Char('C') => copy_query(model, true),
+    Key.Char('/') => no_effect(Model { search: Input { text: "", cursor: 0, active: true }, ..model }),
+    Key.Char('f') => no_effect(Model { filter: Input { text: "", cursor: 0, active: true }, ..model }),
+    Key.Char('w') => no_effect(Model { write_mode: true, ..model }),
+    Key.Char('s') => no_effect(toggle_sort(model)),
+    Key.Char('p') => no_effect(toggle_pause(model)),
+    Key.CtrlL => no_effect(clear(model)),
+    Key.Char('a') => no_effect(enter_analytics(model)),
+    Key.Char('t') => no_effect(Model { screen: Screen.Timeline, timeline_scroll: 0, ..model }),
+    Key.Esc => no_effect(clear_filter(model)),
+    Key.Space => no_effect(toggle_tx(model)),
+    Key.Char('j') | Key.Down => no_effect(navigate(model, true)),
+    Key.Char('k') | Key.Up => no_effect(navigate(model, false)),
+    Key.CtrlD | Key.PgDown => no_effect(page(model, true)),
+    Key.CtrlU | Key.PgUp => no_effect(page(model, false)),
+    _ => no_effect(model),
   }
 }
 
@@ -143,23 +476,21 @@ fn last_index(model: Model) -> int {
   max_int(model.rows.length() - 1, 0)
 }
 
-fn nav_down(model: Model) -> Model {
+// Down/up navigation with follow re-engagement at the bottom.
+fn navigate(model: Model, down: bool) -> Model {
   if model.rows.is_empty() {
     return model
   }
   let last = last_index(model)
-  let cursor = min_int(model.cursor + 1, last)
-  // Reaching the bottom re-engages follow-mode.
-  let follow = cursor == last
-  Model { cursor, follow, ..model }
-}
-
-fn nav_up(model: Model) -> Model {
-  if model.cursor <= 0 {
-    return model
+  if down {
+    let cursor = min_int(model.cursor + 1, last)
+    Model { cursor, follow: cursor == last, ..model }
+  } else {
+    if model.cursor <= 0 {
+      return model
+    }
+    Model { cursor: model.cursor - 1, follow: false, ..model }
   }
-  // Scrolling up always disengages follow.
-  Model { cursor: model.cursor - 1, follow: false, ..model }
 }
 
 fn page(model: Model, down: bool) -> Model {
@@ -167,54 +498,33 @@ fn page(model: Model, down: bool) -> Model {
     return model
   }
   let last = last_index(model)
-  let step = 10
+  let half = max_int(model.list_height(1) / 2, 1)
   if down {
-    let cursor = min_int(model.cursor + step, last)
-    let follow = cursor == last
-    Model { cursor, follow, ..model }
+    let cursor = min_int(model.cursor + half, last)
+    Model { cursor, follow: cursor == last, ..model }
   } else {
-    let cursor = max_int(model.cursor - step, 0)
-    Model { cursor, follow: false, ..model }
+    Model { cursor: max_int(model.cursor - half, 0), follow: false, ..model }
   }
-}
-
-fn go_top(model: Model) -> Model {
-  Model { cursor: 0, follow: false, ..model }
-}
-
-fn go_bottom(model: Model) -> Model {
-  Model { cursor: last_index(model), follow: true, ..model }
 }
 
 fn enter_inspect(model: Model) -> Model {
   if model.rows.is_empty() {
     return model
   }
-  match model.cursor_event() {
-    Some(_) => Model { screen: Screen.Inspect, ..model },
-    None => model, // summary rows have no detail view yet
-  }
+  Model { screen: Screen.Inspect, inspect_scroll: 0, ..model }
 }
 
 fn toggle_pause(model: Model) -> Model {
   if model.paused {
-    // Unpause: flush buffered traffic in order, then stick to the tail.
     let events = model.events.append(model.buffered...)
-    let rebuilt = rebuild(Model { events, buffered: [], paused: false, ..model })
-    stick_to_tail(rebuilt)
+    stick_to_tail_if_following(rebuild(Model { events, buffered: [], paused: false, ..model }))
   } else {
     Model { paused: true, ..model }
   }
 }
 
 fn clear(model: Model) -> Model {
-  rebuild(Model {
-    events: [],
-    buffered: [],
-    cursor: 0,
-    collapsed: [],
-    ..model
-  })
+  rebuild(Model { events: [], buffered: [], cursor: 0, collapsed: [], ..model })
 }
 
 fn toggle_tx(model: Model) -> Model {
@@ -227,7 +537,6 @@ fn toggle_tx(model: Model) -> Model {
     model.collapsed.append(tx_id)
   }
   let rebuilt = rebuild(Model { collapsed, ..model })
-  // Keep the cursor on the summary row we just toggled.
   let cursor = find_summary_row(rebuilt, tx_id).unwrap_or(rebuilt.cursor)
   Model { cursor: min_int(cursor, last_index(rebuilt)), ..rebuilt }
 }
@@ -248,23 +557,465 @@ fn find_summary_row(model: Model, tx_id: string) -> Option<int> {
   None
 }
 
-/// If follow-mode is on, snap the cursor to the last row so new traffic stays
-/// visible. If the user has scrolled up, leave the cursor where it is.
-fn stick_to_tail(model: Model) -> Model {
-  if model.follow {
-    Model { cursor: last_index(model), ..model }
-  } else {
-    // Keep the cursor in range even when not following.
-    Model { cursor: min_int(model.cursor, last_index(model)), ..model }
+fn toggle_sort(model: Model) -> Model {
+  let (sort, follow) = match model.sort {
+    SortMode.Chronological => (SortMode.Duration, false),
+    SortMode.Duration => (SortMode.Chronological, model.follow),
+  }
+  let rebuilt = rebuild(Model { sort, follow, ..model })
+  Model { cursor: 0, ..rebuilt }
+}
+
+fn enter_analytics(model: Model) -> Model {
+  let rows = sort_analytics_rows(build_analytics_rows(model.events), model.analytics_sort)
+  Model {
+    analytics: rows,
+    analytics_cursor: 0,
+    analytics_hscroll: 0,
+    screen: Screen.Analytics,
+    ..model
   }
 }
 
-/// Recompute the display rows from `events` and the collapsed set. Transactions
-/// (identified by a shared tx_id, opened by a Begin op) become a summary row
-/// followed by their member events unless collapsed. Non-tx events are flat.
+fn clear_filter(model: Model) -> Model {
+  let had_search = model.search.text != ""
+  let had_filter = model.filter.text != ""
+  if !had_search && !had_filter {
+    return model
+  }
+  let search = if had_search { Input.empty() } else { model.search }
+  let filter = if had_filter { Input.empty() } else { model.filter }
+  let rebuilt = rebuild(Model { search, filter, ..model })
+  Model { cursor: min_int(rebuilt.cursor, last_index(rebuilt)), ..rebuilt }
+}
+
+// --- search / filter input editing ---------------------------------------
+
+fn update_search(model: Model, key: Key) -> (Model, Effect) {
+  let (input, action) = edit_input(model.search, key)
+  apply_input_edit(model, key, input, action, true)
+}
+
+fn update_filter(model: Model, key: Key) -> (Model, Effect) {
+  let (input, action) = edit_input(model.filter, key)
+  apply_input_edit(model, key, input, action, false)
+}
+
+// What an input edit resolves to beyond producing a new Input value.
+enum InputAction {
+  Continue,   // text/cursor changed; rebuild
+  Accept,     // enter: keep text, leave edit mode, rebuild
+  Cancel,     // esc: clear text, leave edit mode, rebuild
+  Navigate(bool), // up/down: move list cursor (down=true)
+  Quit,       // ctrl+c
+  Ignore,     // no change (e.g. left/right, unhandled key)
+}
+
+fn edit_input(input: Input, key: Key) -> (Input, InputAction) {
+  match key {
+    Key.Enter => (Input { active: false, ..input }, InputAction.Accept),
+    Key.Esc => (Input { text: "", cursor: 0, active: false }, InputAction.Cancel),
+    Key.CtrlC => (input, InputAction.Quit),
+    Key.Backspace => {
+      if input.cursor > 0 {
+        (delete_before_cursor(input), InputAction.Continue)
+      } else {
+        (input, InputAction.Ignore)
+      }
+    },
+    Key.Left => {
+      if input.cursor > 0 {
+        (Input { cursor: input.cursor - 1, ..input }, InputAction.Ignore)
+      } else {
+        (input, InputAction.Ignore)
+      }
+    },
+    Key.Right => {
+      if input.cursor < input.text.runes().length() {
+        (Input { cursor: input.cursor + 1, ..input }, InputAction.Ignore)
+      } else {
+        (input, InputAction.Ignore)
+      }
+    },
+    Key.Up => (input, InputAction.Navigate(false)),
+    Key.Down => (input, InputAction.Navigate(true)),
+    Key.Space => (insert_rune(input, ' '), InputAction.Continue),
+    Key.Char(r) => (insert_rune(input, r), InputAction.Continue),
+    _ => (input, InputAction.Ignore),
+  }
+}
+
+fn insert_rune(input: Input, r: rune) -> Input {
+  let runes = input.text.runes()
+  let before = runes_to_str(runes, 0, input.cursor)
+  let after = runes_to_str(runes, input.cursor, runes.length())
+  Input { text: before + (r as string) + after, cursor: input.cursor + 1, active: input.active }
+}
+
+fn delete_before_cursor(input: Input) -> Input {
+  let runes = input.text.runes()
+  let before = runes_to_str(runes, 0, input.cursor - 1)
+  let after = runes_to_str(runes, input.cursor, runes.length())
+  Input { text: before + after, cursor: input.cursor - 1, active: input.active }
+}
+
+fn runes_to_str(runes: Slice<rune>, lo: int, hi: int) -> string {
+  let mut out = ""
+  let mut i = max_int(lo, 0)
+  let end = min_int(hi, runes.length())
+  while i < end {
+    out += runes[i] as string
+    i += 1
+  }
+  out
+}
+
+fn apply_input_edit(model: Model, key: Key, input: Input, action: InputAction, is_search: bool) -> (Model, Effect) {
+  let base = if is_search {
+    Model { search: input, ..model }
+  } else {
+    Model { filter: input, ..model }
+  }
+  match action {
+    InputAction.Quit => (model, Effect.Quit),
+    InputAction.Ignore => no_effect(base),
+    InputAction.Navigate(down) => no_effect(navigate(base, down)),
+    InputAction.Continue | InputAction.Accept | InputAction.Cancel => {
+      let rebuilt = rebuild(base)
+      no_effect(Model { cursor: min_int(rebuilt.cursor, last_index(rebuilt)), ..rebuilt })
+    },
+  }
+}
+
+fn update_write(model: Model, key: Key) -> (Model, Effect) {
+  let m = Model { write_mode: false, ..model }
+  match key {
+    Key.Char('j') => (m, Effect.RunExport { format: ExportFormat.Json, events: m.events, filter: m.filter.text, search: m.search.text }),
+    Key.Char('m') => (m, Effect.RunExport { format: ExportFormat.Markdown, events: m.events, filter: m.filter.text, search: m.search.text }),
+    _ => no_effect(m),
+  }
+}
+
+// --- copy / explain / edit ------------------------------------------------
+
+fn copy_query(model: Model, with_args: bool) -> (Model, Effect) {
+  let Some(ev) = model.cursor_event() else {
+    return no_effect(model)
+  }
+  if ev.query == "" {
+    return no_effect(model)
+  }
+  let (m, seq) = show_alert(model, "copied!")
+  let text = if with_args { query_bind(ev.query, ev.args) } else { ev.query }
+  (m, Effect.CopyText { text })
+}
+
+fn start_explain(model: Model, kind: ExplainKind) -> (Model, Effect) {
+  let Some(ev) = model.cursor_event() else {
+    return no_effect(model)
+  }
+  if ev.query == "" || !ev.op.is_query() {
+    return no_effect(model)
+  }
+  let m = Model {
+    screen: Screen.Explain,
+    explain: ExplainState.Running,
+    explain_kind: kind,
+    explain_query: ev.query,
+    explain_args: ev.args,
+    explain_scroll: 0,
+    explain_hscroll: 0,
+    ..model
+  }
+  (m, Effect.RunExplain { kind, query: ev.query, args: ev.args })
+}
+
+fn start_edit_explain(model: Model, kind: ExplainKind) -> (Model, Effect) {
+  let Some(ev) = model.cursor_event() else {
+    return no_effect(model)
+  }
+  if ev.query == "" || !ev.op.is_query() {
+    return no_effect(model)
+  }
+  (model, Effect.OpenEditor { kind, query: ev.query, args: ev.args })
+}
+
+// --- inspect -------------------------------------------------------------
+
+fn on_key_inspect(model: Model, key: Key) -> (Model, Effect) {
+  match key {
+    Key.CtrlC => (model, Effect.Quit),
+    Key.Char('q') => no_effect(back_to_list(model)),
+    Key.Char('x') => start_explain(model, ExplainKind.Explain),
+    Key.Char('X') => start_explain(model, ExplainKind.Analyze),
+    Key.Char('e') => start_edit_explain(model, ExplainKind.Explain),
+    Key.Char('E') => start_edit_explain(model, ExplainKind.Analyze),
+    Key.Char('c') => copy_query(model, false),
+    Key.Char('C') => copy_query(model, true),
+    Key.Char('j') | Key.Down => no_effect(scroll_inspect(model, true)),
+    Key.Char('k') | Key.Up => no_effect(scroll_inspect(model, false)),
+    _ => no_effect(model),
+  }
+}
+
+fn scroll_inspect(model: Model, down: bool) -> Model {
+  if down {
+    let total = inspect_lines(model).length()
+    let visible = inspect_visible_rows(model)
+    let max_scroll = max_int(total - visible, 0)
+    Model { inspect_scroll: min_int(model.inspect_scroll + 1, max_scroll), ..model }
+  } else {
+    Model { inspect_scroll: max_int(model.inspect_scroll - 1, 0), ..model }
+  }
+}
+
+fn back_to_list(model: Model) -> Model {
+  let rebuilt = rebuild(Model { screen: Screen.List, ..model })
+  if rebuilt.follow {
+    Model { cursor: last_index(rebuilt), ..rebuilt }
+  } else {
+    rebuilt
+  }
+}
+
+// --- explain view --------------------------------------------------------
+
+fn on_key_explain(model: Model, key: Key) -> (Model, Effect) {
+  match key {
+    Key.CtrlC => (model, Effect.Quit),
+    Key.Char('q') => no_effect(back_to_list(model)),
+    Key.Char('j') | Key.Down => no_effect(scroll_explain_v(model, true)),
+    Key.Char('k') | Key.Up => no_effect(scroll_explain_v(model, false)),
+    Key.Char('h') | Key.Left => no_effect(scroll_explain_h(model, false)),
+    Key.Char('l') | Key.Right => no_effect(scroll_explain_h(model, true)),
+    Key.Char('c') => copy_plan(model),
+    Key.Char('e') => reedit_explain(model, ExplainKind.Explain),
+    Key.Char('E') => reedit_explain(model, ExplainKind.Analyze),
+    _ => no_effect(model),
+  }
+}
+
+fn scroll_explain_v(model: Model, down: bool) -> Model {
+  if down {
+    let total = explain_lines(model).length()
+    let max_scroll = max_int(total - explain_visible_rows(model), 0)
+    Model { explain_scroll: min_int(model.explain_scroll + 1, max_scroll), ..model }
+  } else {
+    Model { explain_scroll: max_int(model.explain_scroll - 1, 0), ..model }
+  }
+}
+
+fn scroll_explain_h(model: Model, right: bool) -> Model {
+  if right {
+    let inner = max_int(model.width - 4, 20)
+    let max_h = max_int(explain_max_line_width(model) - inner, 0)
+    Model { explain_hscroll: min_int(model.explain_hscroll + 1, max_h), ..model }
+  } else {
+    Model { explain_hscroll: max_int(model.explain_hscroll - 1, 0), ..model }
+  }
+}
+
+fn copy_plan(model: Model) -> (Model, Effect) {
+  match model.explain {
+    ExplainState.Plan { text } => {
+      if text == "" {
+        no_effect(model)
+      } else {
+        let (m, seq) = show_alert(model, "copied!")
+        (m, Effect.CopyText { text })
+      }
+    },
+    _ => no_effect(model),
+  }
+}
+
+fn reedit_explain(model: Model, kind: ExplainKind) -> (Model, Effect) {
+  if model.explain_query == "" {
+    return no_effect(model)
+  }
+  (model, Effect.OpenEditor { kind, query: model.explain_query, args: model.explain_args })
+}
+
+// --- analytics view ------------------------------------------------------
+
+fn on_key_analytics(model: Model, key: Key) -> (Model, Effect) {
+  match key {
+    Key.CtrlC => (model, Effect.Quit),
+    Key.Char('q') => no_effect(back_to_list(model)),
+    Key.Char('j') | Key.Down => no_effect(analytics_move(model, 1)),
+    Key.Char('k') | Key.Up => no_effect(analytics_move(model, -1)),
+    Key.Char('h') | Key.Left => no_effect(Model { analytics_hscroll: max_int(model.analytics_hscroll - 1, 0), ..model }),
+    Key.Char('l') | Key.Right => no_effect(analytics_pan_right(model)),
+    Key.CtrlD => no_effect(analytics_page(model, true)),
+    Key.CtrlU => no_effect(analytics_page(model, false)),
+    Key.Char('s') => no_effect(analytics_sort(model)),
+    Key.Char('c') => analytics_copy(model),
+    _ => no_effect(model),
+  }
+}
+
+fn analytics_last(model: Model) -> int {
+  max_int(model.analytics.length() - 1, 0)
+}
+
+fn analytics_move(model: Model, delta: int) -> Model {
+  let c = model.analytics_cursor + delta
+  let clamped = if c < 0 { 0 } else if c > analytics_last(model) { analytics_last(model) } else { c }
+  Model { analytics_cursor: clamped, ..model }
+}
+
+fn analytics_pan_right(model: Model) -> Model {
+  let inner = max_int(model.width - 4, 20)
+  let max_h = max_int(analytics_max_line_width(model) - inner, 0)
+  Model { analytics_hscroll: min_int(model.analytics_hscroll + 1, max_h), ..model }
+}
+
+fn analytics_page(model: Model, down: bool) -> Model {
+  let half = analytics_visible_rows(model) / 2
+  if down {
+    Model { analytics_cursor: min_int(model.analytics_cursor + half, analytics_last(model)), ..model }
+  } else {
+    Model { analytics_cursor: max_int(model.analytics_cursor - half, 0), ..model }
+  }
+}
+
+fn analytics_sort(model: Model) -> Model {
+  let mode = model.analytics_sort.next()
+  let rows = sort_analytics_rows(model.analytics, mode)
+  Model { analytics_sort: mode, analytics: rows, analytics_cursor: 0, ..model }
+}
+
+fn analytics_copy(model: Model) -> (Model, Effect) {
+  if model.analytics_cursor < 0 || model.analytics_cursor >= model.analytics.length() {
+    return no_effect(model)
+  }
+  let text = model.analytics[model.analytics_cursor].query
+  let (m, seq) = show_alert(model, "copied!")
+  (m, Effect.CopyText { text })
+}
+
+// --- timeline view -------------------------------------------------------
+
+fn on_key_timeline(model: Model, key: Key) -> (Model, Effect) {
+  let indices = timeline_events(model)
+  let data_rows = max_int(timeline_visible_rows(model) - 2, 1)
+  let max_scroll = max_int(indices.length() - data_rows, 0)
+  let clamped = Model { timeline_scroll: min_int(model.timeline_scroll, max_scroll), ..model }
+
+  match key {
+    Key.CtrlC => (clamped, Effect.Quit),
+    Key.Char('q') => no_effect(back_to_list(clamped)),
+    Key.Char('j') | Key.Down => no_effect(Model { timeline_scroll: min_int(clamped.timeline_scroll + 1, max_scroll), ..clamped }),
+    Key.Char('k') | Key.Up => no_effect(Model { timeline_scroll: max_int(clamped.timeline_scroll - 1, 0), ..clamped }),
+    Key.CtrlD | Key.PgDown => {
+      let half = max_int(timeline_visible_rows(clamped) / 2, 1)
+      no_effect(Model { timeline_scroll: min_int(clamped.timeline_scroll + half, max_scroll), ..clamped })
+    },
+    Key.CtrlU | Key.PgUp => {
+      let half = max_int(timeline_visible_rows(clamped) / 2, 1)
+      no_effect(Model { timeline_scroll: max_int(clamped.timeline_scroll - half, 0), ..clamped })
+    },
+    _ => no_effect(clamped),
+  }
+}
+
+// --- display-row rebuild -------------------------------------------------
+
+/// The set of event indices passing both the structured filter and text search.
+/// Either query may be empty. Shared by rebuild, timeline, and export.
+pub fn matching_indices(events: Slice<event.Event>, filter_query: string, search_query: string) -> Slice<int> {
+  let conds = if filter_query != "" { parse_filter(filter_query) } else { [] }
+  let search_lower = to_lower(search_query)
+  let mut out: Slice<int> = []
+  let mut i = 0
+  while i < events.length() {
+    let ev = events[i]
+    let pass_filter = conds.is_empty() || match_all_conditions(ev, conds)
+    let pass_search = search_lower == "" || contains_lower(ev.query, search_lower)
+    if pass_filter && pass_search {
+      out = out.append(i)
+    }
+    i += 1
+  }
+  out
+}
+
+/// Recompute the display rows and tx color assignments. With an active filter/
+/// search or duration sort, the list is flat (no tx grouping); duration sort
+/// then orders rows slowest-first. Otherwise transactions opened at a Begin op
+/// become a summary row followed by their (indented) members unless collapsed.
+/// Ported from rebuildDisplayRows.
 pub fn rebuild(model: Model) -> Model {
+  let matched = matching_indices(model.events, model.filter.text, model.search.text)
+  let active = model.filtering() || is_duration_sort(model.sort)
+
+  if active {
+    rebuild_flat(model, matched)
+  } else {
+    rebuild_grouped(model)
+  }
+}
+
+fn is_duration_sort(sort: SortMode) -> bool {
+  match sort { SortMode.Duration => true, SortMode.Chronological => false }
+}
+
+fn rebuild_flat(model: Model, matched: Slice<int>) -> Model {
   let mut rows: Slice<Row> = []
+  let mut colors: Slice<TxColor> = []
+  let mut tx_count = 0
+  let mut i = 0
+  while i < model.events.length() {
+    if matched.contains(i) {
+      let ev = model.events[i]
+      if let Some(tx_id) = ev.tx_id {
+        if colors.find(|c| c.tx_id == tx_id).is_none() {
+          colors = colors.append(TxColor { tx_id, color: cycle_color(tx_count) })
+          tx_count += 1
+        }
+      }
+      rows = rows.append(Row.Event { idx: i })
+    }
+    i += 1
+  }
+  if is_duration_sort(model.sort) {
+    rows = sort_rows_by_duration(model.events, rows)
+  }
+  Model { rows, tx_colors: colors, ..model }
+}
+
+fn sort_rows_by_duration(events: Slice<event.Event>, rows: Slice<Row>) -> Slice<Row> {
+  // Extract event indices, stable-sort by duration desc, rebuild rows.
+  let mut out = rows.map(|r| row_idx(r))
+  // insertion-style stable sort (rows are few; keeps deterministic order)
+  let n = out.length()
+  let mut i = 1
+  while i < n {
+    let key = out[i]
+    let key_dur = events[key].duration
+    let mut j = i - 1
+    while j >= 0 && events[out[j]].duration < key_dur {
+      out[j + 1] = out[j]
+      j -= 1
+    }
+    out[j + 1] = key
+    i += 1
+  }
+  out.map(|idx| Row.Event { idx })
+}
+
+fn row_idx(r: Row) -> int {
+  match r {
+    Row.Event { idx } => idx,
+    Row.TxSummary { .. } => 0,
+  }
+}
+
+fn rebuild_grouped(model: Model) -> Model {
+  let mut rows: Slice<Row> = []
+  let mut colors: Slice<TxColor> = []
   let mut seen: Slice<string> = []
+  let mut tx_count = 0
   let mut i = 0
   let n = model.events.length()
 
@@ -272,10 +1023,10 @@ pub fn rebuild(model: Model) -> Model {
     let ev = model.events[i]
     match ev.tx_id {
       Some(tx_id) => {
-        if seen.contains(tx_id) {
-          // Member already emitted under its summary — skip.
-        } else {
+        if is_begin(ev.op) && !seen.contains(tx_id) {
           seen = seen.append(tx_id)
+          colors = colors.append(TxColor { tx_id, color: cycle_color(tx_count) })
+          tx_count += 1
           let members = tx_members(model.events, tx_id)
           rows = rows.append(Row.TxSummary { tx_id, members })
           if !model.is_collapsed(tx_id) {
@@ -283,6 +1034,10 @@ pub fn rebuild(model: Model) -> Model {
               rows = rows.append(Row.Event { idx: j })
             }
           }
+        } else if seen.contains(tx_id) {
+          // already handled under its summary — skip
+        } else {
+          rows = rows.append(Row.Event { idx: i })
         }
       },
       None => {
@@ -291,8 +1046,16 @@ pub fn rebuild(model: Model) -> Model {
     }
     i += 1
   }
+  Model { rows, tx_colors: colors, ..model }
+}
 
-  Model { rows, ..model }
+fn is_begin(op: event.Op) -> bool {
+  match op { event.Op.Begin => true, _ => false }
+}
+
+fn cycle_color(n: int) -> string {
+  let cycle = tx_color_cycle()
+  cycle[n % cycle.length()]
 }
 
 fn tx_members(events: Slice<event.Event>, tx_id: string) -> Slice<int> {

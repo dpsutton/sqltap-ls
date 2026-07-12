@@ -54,7 +54,25 @@ impl Terminal {
   /// Paint a whole frame: home the cursor, then a single write of the frame
   /// string. No partial updates — the frame is the complete screen.
   pub fn paint(self, frame: string) {
-    write_raw(f"{CURSOR_HOME}{frame}")
+    write_raw(f"{CLEAR_HOME}{frame}")
+  }
+
+  /// Leave raw mode and the alternate screen so an external program (the
+  /// editor) owns a normal cooked terminal. Returns Ok on success; the caller
+  /// pairs this with `resume`. Used only from the run loop's editor path.
+  pub fn suspend(self) -> Result<(), error> {
+    write_raw(f"{CURSOR_SHOW}{ALT_SCREEN_LEAVE}")
+    term.Restore(self.fd, self.saved)?
+    Ok(())
+  }
+
+  /// Re-enter raw mode and the alternate screen after `suspend`. The saved
+  /// termios captured at `enter` is re-applied by making the fd raw again.
+  pub fn resume(self: Ref<Terminal>) -> Result<(), error> {
+    let saved = term.MakeRaw(self.fd)?
+    self.saved = saved
+    write_raw(f"{ALT_SCREEN_ENTER}{CURSOR_HIDE}{CLEAR_HOME}")
+    Ok(())
   }
 }
 

@@ -1,0 +1,252 @@
+import "go:encoding/json"
+import "go:fmt"
+import "go:os"
+import "go:path/filepath"
+import "go:strings"
+import "go:time"
+import "go:io/fs"
+import "event"
+
+/// Output format for an export.
+pub enum ExportFormat {
+  Json,
+  Markdown,
+}
+
+impl ExportFormat {
+  fn ext(self) -> string {
+    match self {
+      ExportFormat.Json => "json",
+      ExportFormat.Markdown => "md",
+    }
+  }
+}
+
+/// One analytics entry in an export (durations in milliseconds).
+#[json]
+pub struct ExportAnalyticsRow {
+  pub query: string,
+  pub count: int,
+  pub total_ms: float64,
+  pub avg_ms: float64,
+  pub p95_ms: float64,
+  pub max_ms: float64,
+}
+
+/// One captured query in an export.
+#[json]
+pub struct ExportQuery {
+  pub time: string,
+  pub op: string,
+  pub query: string,
+  pub args: Slice<string>,
+  pub duration_ms: float64,
+  pub rows_affected: int64,
+  pub error: string,
+  pub tx_id: string,
+}
+
+/// The period covered by an export (local-time HH:MM:SS strings).
+#[json]
+pub struct ExportPeriod {
+  pub start: string,
+  pub end: string,
+}
+
+/// The full export payload. Marshals to the same JSON shape as the Go original.
+#[json]
+pub struct ExportData {
+  pub captured: int,
+  pub exported: int,
+  pub filter: string,
+  pub search: string,
+  pub period: ExportPeriod,
+  pub queries: Slice<ExportQuery>,
+  pub analytics: Slice<ExportAnalyticsRow>,
+}
+
+/// The subset of `events` passing both the structured filter and text search.
+pub fn filtered_events(events: Slice<event.Event>, filter_query: string, search_query: string) -> Slice<event.Event> {
+  let matched = matching_indices(events, filter_query, search_query)
+  let mut out: Slice<event.Event> = []
+  let mut i = 0
+  while i < events.length() {
+    if matched.contains(i) {
+      out = out.append(events[i])
+    }
+    i += 1
+  }
+  out
+}
+
+/// Aggregate export analytics from events, preserving first-seen order.
+pub fn build_export_analytics(events: Slice<event.Event>) -> Slice<ExportAnalyticsRow> {
+  let rows = build_analytics_rows(events)
+  rows.map(|r| ExportAnalyticsRow {
+    query: r.query,
+    count: r.count,
+    total_ms: dur_ms(r.total),
+    avg_ms: dur_ms(r.avg),
+    p95_ms: dur_ms(r.p95),
+    max_ms: dur_ms(r.max),
+  })
+}
+
+fn dur_ms(d: time.Duration) -> float64 {
+  (d.Microseconds() as float64) / 1000.0
+}
+
+/// Build the export payload from all events, a filter, and a search string.
+pub fn build_export_data(all_events: Slice<event.Event>, filter_query: string, search_query: string) -> ExportData {
+  let exported = filtered_events(all_events, filter_query, search_query)
+
+  let period = if exported.is_empty() {
+    ExportPeriod { start: "", end: "" }
+  } else {
+    let first = exported[0].start_time
+    let last = exported[exported.length() - 1].start_time
+    ExportPeriod {
+      start: first.In(time.Local).Format("15:04:05"),
+      end: last.In(time.Local).Format("15:04:05"),
+    }
+  }
+
+  let queries = exported.map(to_export_query)
+  let analytics = build_export_analytics(exported)
+
+  ExportData {
+    captured: all_events.length(),
+    exported: exported.length(),
+    filter: filter_query,
+    search: search_query,
+    period,
+    queries,
+    analytics,
+  }
+}
+
+fn to_export_query(ev: event.Event) -> ExportQuery {
+  let error = ev.outcome.error_message().unwrap_or("")
+  ExportQuery {
+    time: ev.start_time.In(time.Local).Format("15:04:05.000"),
+    op: op_label(ev.op),
+    query: ev.query,
+    args: ev.args,
+    duration_ms: dur_ms(ev.duration),
+    rows_affected: ev.outcome.rows(),
+    error,
+    tx_id: ev.tx_id.unwrap_or(""),
+  }
+}
+
+/// Render the export payload as pretty-printed JSON with a trailing newline.
+pub fn render_json(all_events: Slice<event.Event>, filter_query: string, search_query: string) -> Result<string, error> {
+  let d = build_export_data(all_events, filter_query, search_query)
+  let b = json.MarshalIndent(d, "", "  ").wrap_err("marshal export")?
+  Ok(b as string + "\n")
+}
+
+/// Render the export payload as a Markdown report.
+pub fn render_markdown(all_events: Slice<event.Event>, filter_query: string, search_query: string) -> string {
+  let d = build_export_data(all_events, filter_query, search_query)
+  let mut sb = "# sql-tap export\n\n"
+
+  sb += f"- Captured: {d.captured} queries\n"
+  let mut export_line = f"- Exported: {d.exported} queries"
+  if d.filter != "" || d.search != "" {
+    let mut parts: Slice<string> = []
+    if d.filter != "" {
+      parts = parts.append(f"filter: {d.filter}")
+    }
+    if d.search != "" {
+      parts = parts.append(f"search: {d.search}")
+    }
+    let joined = strings.Join(parts, ", ")
+    export_line += f" ({joined})"
+  }
+  sb += export_line + "\n"
+  if d.period.start != "" {
+    sb += f"- Period: {d.period.start} — {d.period.end}\n"
+  }
+
+  sb += "\n## Queries\n\n"
+  sb += "| # | Time | Op | Duration | Query | Args | Error |\n"
+  sb += "|---|------|----|----------|-------|------|-------|\n"
+  let mut i = 0
+  while i < d.queries.length() {
+    let q = d.queries[i]
+    let n = i + 1
+    let args_str = format_args_md(q.args)
+    let dur = format_dur_ms(q.duration_ms)
+    let query_cell = escape_md_pipe(q.query)
+    let error_cell = escape_md_pipe(q.error)
+    sb += f"| {n} | {q.time} | {q.op} | {dur} | {query_cell} | {args_str} | {error_cell} |\n"
+    i += 1
+  }
+
+  if !d.analytics.is_empty() {
+    sb += "\n## Analytics\n\n"
+    sb += "| Query | Count | Avg | P95 | Max | Total |\n"
+    sb += "|-------|-------|-----|-----|-----|-------|\n"
+    for a in d.analytics {
+      let query_cell = escape_md_pipe(a.query)
+      let avg = format_dur_ms(a.avg_ms)
+      let p95 = format_dur_ms(a.p95_ms)
+      let mx = format_dur_ms(a.max_ms)
+      let total = format_dur_ms(a.total_ms)
+      sb += f"| {query_cell} | {a.count} | {avg} | {p95} | {mx} | {total} |\n"
+    }
+  }
+
+  sb
+}
+
+fn format_dur_ms(ms: float64) -> string {
+  if ms < 1.0 {
+    fmt.Sprintf("%.0fµs", ms * 1000.0)
+  } else if ms < 1000.0 {
+    fmt.Sprintf("%.1fms", ms)
+  } else {
+    fmt.Sprintf("%.2fs", ms / 1000.0)
+  }
+}
+
+fn format_args_md(args: Slice<string>) -> string {
+  if args.is_empty() {
+    return ""
+  }
+  let quoted = args.map(|a| f"'{a}'")
+  let joined = strings.Join(quoted, ", ")
+  f"[{joined}]"
+}
+
+/// Escape pipe characters so a cell value cannot break a Markdown table.
+pub fn escape_md_pipe(s: string) -> string {
+  strings.ReplaceAll(s, "|", "\\|")
+}
+
+/// Write a filtered export to `dir` (cwd when empty) and return the path.
+/// `now` and `dir` are injected so tests are deterministic (effects at the edge).
+pub fn write_export(
+  all_events: Slice<event.Event>,
+  filter_query: string,
+  search_query: string,
+  format: ExportFormat,
+  dir: string,
+  now: time.Time,
+) -> Result<string, error> {
+  let content = match format {
+    ExportFormat.Json => render_json(all_events, filter_query, search_query)?,
+    ExportFormat.Markdown => render_markdown(all_events, filter_query, search_query),
+  }
+
+  let stamp = now.Format("20060102-150405")
+  let ext = format.ext()
+  let mut filename = f"sql-tap-{stamp}.{ext}"
+  if dir != "" {
+    filename = filepath.Join(dir, filename)
+  }
+
+  os.WriteFile(filename, content as Slice<byte>, 0o600 as fs.FileMode).wrap_err("write export")?
+  Ok(filename)
+}

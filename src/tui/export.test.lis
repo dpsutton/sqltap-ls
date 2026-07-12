@@ -1,0 +1,133 @@
+import "go:encoding/json"
+import "go:os"
+import "go:strings"
+import "go:time"
+import "event"
+
+fn xev(op: event.Op, query: string, normalized: string, args: Slice<string>, dur: time.Duration, start: time.Time) -> event.Event {
+  event.Event {
+    id: "",
+    op,
+    query,
+    args,
+    start_time: start,
+    duration: dur,
+    outcome: event.Outcome.Ok { rows_affected: 0 },
+    tx_id: None,
+    nplus1: false,
+    slow: false,
+    normalized_query: normalized,
+  }
+}
+
+fn test_events() -> Slice<event.Event> {
+  let base = time.Date(2026, time.February, 20, 15, 4, 5, 123000000, time.UTC)
+  [
+    xev(event.Op.Query, "SELECT id FROM users WHERE email = $1", "SELECT id FROM users WHERE email = $1", ["alice@example.com"], 152300 * time.Microsecond, base),
+    xev(event.Op.Query, "SELECT id FROM users WHERE email = $1", "SELECT id FROM users WHERE email = $1", ["bob@example.com"], 203100 * time.Microsecond, base.Add(1 * time.Second)),
+    xev(event.Op.Exec, "INSERT INTO orders (user_id) VALUES ($1)", "INSERT INTO orders (user_id) VALUES ($1)", ["1"], 50 * time.Millisecond, base.Add(2 * time.Second)),
+  ]
+}
+
+// --- render_markdown (port of TestRenderMarkdown) ------------------------
+
+#[test("tui: render_markdown contains report sections")]
+fn test_render_markdown() {
+  let md = render_markdown(test_events(), "", "")
+  let checks = [
+    "# sql-tap export",
+    "- Captured: 3 queries",
+    "- Exported: 3 queries",
+    "## Queries",
+    "| # | Time | Op | Duration | Query | Args | Error |",
+    "SELECT id FROM users WHERE email = $1",
+    "['alice@example.com']",
+    "INSERT INTO orders",
+    "## Analytics",
+    "| Query | Count | Avg | P95 | Max | Total |",
+  ]
+  for want in checks {
+    assert strings.Contains(md, want)
+  }
+}
+
+#[test("tui: render_markdown filtered narrows the export")]
+fn test_render_markdown_filtered() {
+  let md = render_markdown(test_events(), "op:select", "")
+  assert strings.Contains(md, "- Captured: 3 queries")
+  assert strings.Contains(md, "- Exported: 2 queries")
+  assert strings.Contains(md, "(filter: op:select)")
+  assert !strings.Contains(md, "INSERT INTO orders")
+}
+
+// --- render_json (port of TestRenderJSON) --------------------------------
+
+#[test("tui: render_json structure with filter and search")]
+fn test_render_json() -> Result<(), error> {
+  let out = render_json(test_events(), "op:select", "users")?
+  let mut d = ExportData { captured: 0, .. }
+  json.Unmarshal(out as Slice<byte>, &d)?
+  assert d.captured == 3
+  assert d.exported == 2
+  assert d.filter == "op:select"
+  assert d.search == "users"
+  assert d.queries.length() == 2
+  assert d.analytics.length() == 1
+  assert d.analytics[0].count == 2
+  Ok(())
+}
+
+#[test("tui: render_json empty args serialize as an empty array")]
+fn test_render_json_empty_args() -> Result<(), error> {
+  let base = time.Date(2026, time.February, 20, 15, 0, 0, 0, time.UTC)
+  let events = [xev(event.Op.Query, "SELECT 1", "SELECT ?", [], 10 * time.Millisecond, base)]
+  let out = render_json(events, "", "")?
+  let mut d = ExportData { captured: 0, .. }
+  json.Unmarshal(out as Slice<byte>, &d)?
+  assert d.queries[0].args.length() == 0
+  Ok(())
+}
+
+// --- write_export (port of TestWriteExport) ------------------------------
+
+#[test("tui: write_export writes markdown and json files")]
+fn test_write_export() -> Result<(), error> {
+  let events = test_events()
+  let dir = os.TempDir()
+  let now = time.Date(2026, time.February, 20, 15, 4, 5, 0, time.UTC)
+
+  let md_path = write_export(events, "", "", ExportFormat.Markdown, dir, now)?
+  assert strings.HasSuffix(md_path, ".md")
+  let md_data = os.ReadFile(md_path)?
+  assert strings.Contains(md_data as string, "# sql-tap export")
+  let _ = os.Remove(md_path)
+
+  // Use a distinct second so the json filename does not collide with the md one.
+  let now2 = time.Date(2026, time.February, 20, 15, 4, 6, 0, time.UTC)
+  let json_path = write_export(events, "", "", ExportFormat.Json, dir, now2)?
+  assert strings.HasSuffix(json_path, ".json")
+  let json_data = os.ReadFile(json_path)?
+  let mut d = ExportData { captured: 0, .. }
+  json.Unmarshal(json_data, &d)?
+  assert d.captured == 3
+  let _ = os.Remove(json_path)
+  Ok(())
+}
+
+// --- build_export_analytics (port of TestBuildExportAnalytics) -----------
+
+#[test("tui: build_export_analytics groups in first-seen order")]
+fn test_build_export_analytics() {
+  let rows = build_export_analytics(test_events())
+  assert rows.length() == 2
+  assert rows[0].count == 2
+  assert strings.Contains(rows[0].query, "SELECT")
+  assert rows[1].count == 1
+}
+
+// --- escape_md_pipe (port of TestEscapeMarkdownPipe) ---------------------
+
+#[test("tui: escape_md_pipe escapes table pipes")]
+fn test_escape_pipe() {
+  assert escape_md_pipe("a | b | c") == "a \\| b \\| c"
+}

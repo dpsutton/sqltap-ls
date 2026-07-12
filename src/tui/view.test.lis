@@ -41,7 +41,7 @@ fn vev(id: string, op: event.Op, query: string, dur: time.Duration, tx: Option<s
 fn model_with(events: Slice<event.Event>) -> Model {
   let mut m = Model.new()
   for e in events {
-    m = update(m, Msg.Incoming(e))
+    m = up(m, Msg.Incoming(e))
   }
   m
 }
@@ -120,7 +120,7 @@ fn test_row_truncation() {
 #[test("paused model shows [PAUSED] in the title and footer")]
 fn test_paused_marker() {
   let mut m = model_with([vev("a", event.Op.Query, "SELECT 1", 120 * time.Microsecond, None)])
-  m = update(m, Msg.Press(Key.Char('p')))
+  m = up(m, Msg.Press(Key.Char('p')))
   let frame = strip_ansi(view(m, 100, 24))
   assert frame.contains("[PAUSED]")
 }
@@ -161,18 +161,18 @@ fn test_footer() {
 
 // --- inspect view rendering ----------------------------------------------
 
-#[test("inspect view renders full detail and a back hint")]
+#[test("tui: inspect view renders full detail and a back hint")]
 fn test_inspect_render() {
   let mut m = model_with([
     vev("evt-1", event.Op.Query, "SELECT * FROM orders", 900 * time.Microsecond, None),
   ])
-  m = update(m, Msg.Press(Key.Enter))
+  m = up(m, Msg.Press(Key.Enter))
   let frame = strip_ansi(view(m, 100, 24))
-  assert frame.contains("inspect")
-  assert frame.contains("evt-1")
+  assert frame.contains("Inspector")
   assert frame.contains("SELECT * FROM orders")
   assert frame.contains("Rows:")
-  assert frame.contains("q/esc: back")
+  assert frame.contains("Time:")
+  assert frame.contains("q: back")
 }
 
 #[test("every list frame line fits within the terminal width")]
