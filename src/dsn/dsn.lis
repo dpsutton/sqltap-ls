@@ -1,0 +1,51 @@
+import "go:errors"
+import "go:strings"
+
+/// A database/sql driver selected from a DSN string.
+pub enum SqlDriver {
+  Pgx,
+  Mysql,
+}
+
+impl SqlDriver {
+  /// The database/sql driver name to register/open with.
+  pub fn driver_name(self) -> string {
+    match self {
+      SqlDriver.Pgx => "pgx",
+      SqlDriver.Mysql => "mysql",
+    }
+  }
+}
+
+/// Infer the database driver from a DSN string.
+///
+///   - empty -> error
+///   - lowercase "postgres://" or "postgresql://" prefix -> Pgx
+///   - contains "@" (MySQL-style user:pass@tcp(...)/db) -> Mysql
+///   - contains "=" but not "@" (PostgreSQL key=value style) -> Pgx
+///   - otherwise -> error mentioning the DSN
+pub fn detect(raw: string) -> Result<SqlDriver, error> {
+  if raw == "" {
+    return Err(errors.New("dsn: empty DSN"))
+  }
+
+  let lower = strings.ToLower(raw)
+  if strings.HasPrefix(lower, "postgres://") || strings.HasPrefix(lower, "postgresql://") {
+    Ok(SqlDriver.Pgx)
+  } else if strings.Contains(raw, "@") {
+    Ok(SqlDriver.Mysql)
+  } else if strings.Contains(raw, "=") {
+    Ok(SqlDriver.Pgx)
+  } else {
+    Err(errors.New(f"dsn: cannot detect driver from: {raw}"))
+  }
+}
+
+/// The DSN to hand to sql.Open for the given driver: a leading "mysql://"
+/// prefix is stripped for Mysql, otherwise the DSN is returned unchanged.
+pub fn open_dsn(driver: SqlDriver, raw: string) -> string {
+  match driver {
+    SqlDriver.Mysql => strings.TrimPrefix(raw, "mysql://"),
+    SqlDriver.Pgx => raw,
+  }
+}
