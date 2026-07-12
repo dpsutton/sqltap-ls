@@ -1,0 +1,58 @@
+import "event"
+import "go:crypto/rand"
+import "go:encoding/hex"
+import "go:strings"
+
+/// Per-connection transaction state. Owned by a single connection actor,
+/// so no locking is needed.
+pub struct TxTracker {
+  active: Option<string>,
+}
+
+/// The transaction id and (possibly overridden) op for one statement.
+pub struct TxInfo {
+  pub tx_id: Option<string>,
+  pub op: event.Op,
+}
+
+impl TxTracker {
+  pub fn new() -> TxTracker {
+    TxTracker { active: None }
+  }
+
+  /// Classify a statement and update transaction state. `fresh_id` is used
+  /// only when the statement opens a new transaction — the caller supplies
+  /// the randomness so transitions stay deterministic in tests.
+  pub fn transition(
+    self: Ref<TxTracker>,
+    query: string,
+    default_op: event.Op,
+    fresh_id: string,
+  ) -> TxInfo {
+    let upper = strings.ToUpper(strings.TrimSpace(query))
+    if strings.HasPrefix(upper, "BEGIN") || strings.HasPrefix(upper, "START TRANSACTION") {
+      self.active = Some(fresh_id)
+      TxInfo { tx_id: Some(fresh_id), op: event.Op.Begin }
+    } else if strings.HasPrefix(upper, "COMMIT") {
+      let prev = self.active
+      self.active = None
+      TxInfo { tx_id: prev, op: event.Op.Commit }
+    } else if strings.HasPrefix(upper, "ROLLBACK") {
+      let prev = self.active
+      self.active = None
+      TxInfo { tx_id: prev, op: event.Op.Rollback }
+    } else {
+      TxInfo { tx_id: self.active, op: default_op }
+    }
+  }
+}
+
+/// Random 32-hex-char id for a new transaction.
+pub fn random_tx_id() -> string {
+  let mut buf: Slice<byte> = []
+  for _ in 0..16 {
+    buf = buf.append(0)
+  }
+  let _ = rand.Read(buf)
+  hex.EncodeToString(buf)
+}

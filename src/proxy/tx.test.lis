@@ -1,0 +1,56 @@
+import "event"
+
+#[test("begin/commit lifecycle assigns and clears tx ids")]
+fn test_tx_lifecycle() {
+  let mut tracker = TxTracker.new()
+
+  let begin = tracker.transition("BEGIN", event.Op.Query, "id-1")
+  assert begin.op == event.Op.Begin
+  let assert Some(id) = begin.tx_id
+  assert id == "id-1"
+
+  let mid = tracker.transition("SELECT 1", event.Op.Query, "unused")
+  assert mid.op == event.Op.Query
+  let assert Some(mid_id) = mid.tx_id
+  assert mid_id == "id-1"
+
+  let commit = tracker.transition("commit", event.Op.Query, "unused")
+  assert commit.op == event.Op.Commit
+  let assert Some(commit_id) = commit.tx_id
+  assert commit_id == "id-1"
+
+  let after = tracker.transition("SELECT 2", event.Op.Query, "unused")
+  assert after.tx_id == None
+  assert after.op == event.Op.Query
+}
+
+#[test("rollback and start transaction variants")]
+fn test_rollback_and_start() {
+  let mut tracker = TxTracker.new()
+
+  let begin = tracker.transition("  start transaction isolation level serializable", event.Op.Execute, "id-9")
+  assert begin.op == event.Op.Begin
+  let assert Some(id) = begin.tx_id
+  assert id == "id-9"
+
+  let rollback = tracker.transition("ROLLBACK", event.Op.Execute, "unused")
+  assert rollback.op == event.Op.Rollback
+  let assert Some(rb_id) = rollback.tx_id
+  assert rb_id == "id-9"
+}
+
+#[test("commit outside a transaction has no tx id")]
+fn test_commit_without_begin() {
+  let mut tracker = TxTracker.new()
+  let commit = tracker.transition("COMMIT", event.Op.Query, "unused")
+  assert commit.op == event.Op.Commit
+  assert commit.tx_id == None
+}
+
+#[test("random tx ids are 32 hex chars and unique")]
+fn test_random_tx_id() {
+  let a = random_tx_id()
+  let b = random_tx_id()
+  assert a.length() == 32
+  assert a != b
+}
