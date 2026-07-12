@@ -82,7 +82,7 @@ fn test_explain_unconfigured() -> Result<(), error> {
   }
   let mut result = ExplainResponse { .. }
   json.NewDecoder(rc).Decode(&result)?
-  assert strings.Contains(result.error, "not configured")
+  assert strings.Contains(result.err_msg, "not configured")
   Ok(())
 }
 

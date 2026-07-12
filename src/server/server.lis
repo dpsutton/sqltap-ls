@@ -132,8 +132,8 @@ struct ExplainRequest {
 /// Response body for POST /api/explain. Exactly one of `plan`/`error` is set.
 #[json]
 struct ExplainResponse {
-  #[json(omitempty)] plan: string,
-  #[json(omitempty)] error: string,
+  #[json(omitempty)] pub plan: string,
+  #[json("error", omitempty)] pub err_msg: string,
 }
 
 /// Run EXPLAIN for the posted query. 503 when unconfigured, 400 on a bad body,
@@ -141,7 +141,7 @@ struct ExplainResponse {
 fn handle_explain(client: Option<explain.Client>, w: http.ResponseWriter, r: Ref<http.Request>) {
   let Some(ex) = client else {
     write_json(w, http.StatusServiceUnavailable, ExplainResponse {
-      error: "EXPLAIN is not configured (set DATABASE_URL)",
+      err_msg: "EXPLAIN is not configured (set DATABASE_URL)",
       ..
     })
     return
@@ -151,7 +151,7 @@ fn handle_explain(client: Option<explain.Client>, w: http.ResponseWriter, r: Ref
     Some(rc) => rc,
     None => {
       write_json(w, http.StatusBadRequest, ExplainResponse {
-        error: "invalid request body: missing body",
+        err_msg: "invalid request body: missing body",
         ..
       })
       return
@@ -161,7 +161,7 @@ fn handle_explain(client: Option<explain.Client>, w: http.ResponseWriter, r: Ref
   let mut req = ExplainRequest { .. }
   if let Err(e) = json.NewDecoder(body).Decode(&req) {
     write_json(w, http.StatusBadRequest, ExplainResponse {
-      error: f"invalid request body: {e}",
+      err_msg: f"invalid request body: {e}",
       ..
     })
     return
@@ -171,7 +171,7 @@ fn handle_explain(client: Option<explain.Client>, w: http.ResponseWriter, r: Ref
   match ex.run(r.Context(), mode, req.query, req.args) {
     Ok(out) => write_json(w, http.StatusOK, ExplainResponse { plan: out.plan, .. }),
     Err(e) => write_json(w, http.StatusInternalServerError, ExplainResponse {
-      error: f"{e}",
+      err_msg: f"{e}",
       ..
     }),
   }
