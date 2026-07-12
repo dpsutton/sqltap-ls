@@ -1,0 +1,191 @@
+import "go:encoding/binary"
+import "go:io"
+
+/// MySQL capability flags the proxy must disable because it inspects raw
+/// packets: SSL, compression, the deprecate-EOF protocol variant, zstd
+/// compression, and query attributes. Cleared from both the server greeting
+/// and the client handshake response during startup.
+const CLIENT_COMPRESS: uint32 = 32
+
+const CLIENT_SSL: uint32 = 2048
+
+const CLIENT_DEPRECATE_EOF: uint32 = 16777216
+
+const CLIENT_ZSTD: uint32 = 67108864
+
+const CLIENT_QUERY_ATTRIBUTES: uint32 = 134217728
+
+/// The union of capability bits stripped during the handshake.
+pub fn strip_caps() -> uint32 {
+  CLIENT_SSL | CLIENT_COMPRESS | CLIENT_DEPRECATE_EOF | CLIENT_ZSTD |
+  CLIENT_QUERY_ATTRIBUTES
+}
+
+/// Read one MySQL packet from `r`: a 3-byte little-endian payload length, a
+/// 1-byte sequence id, then the payload. Returns the whole packet (header
+/// included) so it can be relayed verbatim.
+pub fn read_packet(r: io.Reader) -> Result<Slice<byte>, error> {
+  let mut hdr: Slice<byte> = [0, 0, 0, 0]
+  read_full(r, hdr).wrap_err("mysql: read packet header")?
+  let payload_len = (hdr[0] as int) | ((hdr[1] as int) << 8) |
+  ((hdr[2] as int) << 16)
+  let mut pkt: Slice<byte> = [hdr[0], hdr[1], hdr[2], hdr[3]]
+  if payload_len > 0 {
+    let mut body: Slice<byte> = []
+    for _ in 0..payload_len {
+      body = body.append(0)
+    }
+    read_full(r, body).wrap_err("mysql: read packet payload")?
+    for b in body {
+      pkt = pkt.append(b)
+    }
+  }
+  Ok(pkt)
+}
+
+/// io.ReadFull surfaces as `Partial<int, error>` (value AND error), so adapt it
+/// to a `Result<(), error>` for `?`-propagation.
+fn read_full(r: io.Reader, mut buf: Slice<byte>) -> Result<(), error> {
+  match io.ReadFull(r, buf) {
+    Partial.Ok(_) => Ok(()),
+    Partial.Err(e) => Err(e),
+    Partial.Both(_, e) => Err(e),
+  }
+}
+
+/// First byte of the payload (the command / type indicator). Returns 0 when
+/// there is no payload.
+pub fn payload_byte(pkt: Slice<byte>) -> byte {
+  if pkt.length() <= 4 { 0 } else { pkt[4] }
+}
+
+/// Payload length as encoded in the 3-byte header.
+pub fn payload_len(pkt: Slice<byte>) -> int {
+  (pkt[0] as int) | ((pkt[1] as int) << 8) | ((pkt[2] as int) << 16)
+}
+
+/// A packet is an EOF packet when its first payload byte is 0xFE and the
+/// payload is shorter than 9 bytes (distinguishing it from a length-encoded
+/// integer that happens to start with 0xFE).
+pub fn is_eof_packet(pkt: Slice<byte>) -> bool {
+  payload_byte(pkt) == 0xFE && payload_len(pkt) < 9
+}
+
+/// Read a length-encoded integer from `data` at `offset`, returning the value
+/// and the number of bytes consumed. A consumed count of 0 signals a malformed
+/// or truncated encoding.
+pub fn read_lenenc_int(data: Slice<byte>, offset: int) -> (uint64, int) {
+  if offset >= data.length() { return (0, 0) }
+  let first = data[offset]
+  if first < 0xFB {
+    (first as uint64, 1)
+  } else if first == 0xFC {
+    if offset + 2 >= data.length() {
+      (0, 0)
+    } else {
+      (binary.LittleEndian.Uint16(data[offset + 1..offset + 3]) as uint64, 3)
+    }
+  } else if first == 0xFD {
+    if offset + 3 >= data.length() {
+      (0, 0)
+    } else {
+      let b0 = data[offset + 1] as uint64
+      let b1 = (data[offset + 2] as uint64) << 8
+      let b2 = (data[offset + 3] as uint64) << 16
+      (b0 | b1 | b2, 4)
+    }
+  } else if first == 0xFE {
+    if offset + 8 >= data.length() {
+      (0, 0)
+    } else {
+      (binary.LittleEndian.Uint64(data[offset + 1..offset + 9]), 9)
+    }
+  } else {
+    (0, 0)
+  }
+}
+
+/// Index of the first `0x00` byte in `data` at or after `start`, or -1.
+fn index_nul(data: Slice<byte>, start: int) -> int {
+  let mut i = start
+  while i < data.length() {
+    if data[i] == 0x00 { return i }
+    i += 1
+  }
+  -1
+}
+
+/// Clear the given capability bits in a server greeting packet, mutating the
+/// slice in place and returning it.
+///
+/// The HandshakeV10 layout has a NUL-terminated, variable-length server
+/// version string, so the capability offsets must be found relative to that
+/// NUL. Layout after payload[0] (protocol version) and the version string:
+/// base+13 holds the lower 2 capability bytes, base+18 the upper 2 (both
+/// little-endian). Bounds are checked exactly like the Go original.
+pub fn clear_capability_bits(mut pkt: Slice<byte>, bits: uint32) -> Slice<byte> {
+  let payload_start = 4
+  let plen = pkt.length() - payload_start
+  if plen <= 0 { return pkt }
+  // Version string starts at payload offset 1; find its NUL terminator.
+  let nul = index_nul(pkt, payload_start + 1)
+  if nul < 0 { return pkt }
+  // base is the payload offset just past protocol_version + version + NUL.
+  let base = (nul - payload_start) + 1
+
+  if (base + 13 + 2) <= plen {
+    let lower_off = payload_start + base + 13
+    let lower = binary.LittleEndian.Uint16(pkt[lower_off..lower_off + 2])
+    let lower_mask = ((bits & 0xFFFF) as uint16) ^ (0xFFFF as uint16)
+    let cleared_lower = lower & lower_mask
+    let mut lower_buf: Slice<byte> = [0, 0]
+    binary.LittleEndian.PutUint16(lower_buf, cleared_lower)
+    pkt[lower_off] = lower_buf[0]
+    pkt[lower_off + 1] = lower_buf[1]
+  }
+
+  if (base + 18 + 2) <= plen {
+    let upper_off = payload_start + base + 18
+    let upper = binary.LittleEndian.Uint16(pkt[upper_off..upper_off + 2])
+    let upper_mask = ((bits >> 16) as uint16) ^ (0xFFFF as uint16)
+    let cleared_upper = upper & upper_mask
+    let mut upper_buf: Slice<byte> = [0, 0]
+    binary.LittleEndian.PutUint16(upper_buf, cleared_upper)
+    pkt[upper_off] = upper_buf[0]
+    pkt[upper_off + 1] = upper_buf[1]
+  }
+  pkt
+}
+
+/// Clear the given capability bits in a client handshake response, mutating the
+/// slice in place and returning it. The client capability flags are the first
+/// 4 bytes of the payload, little-endian.
+pub fn clear_client_capability_bits(mut pkt: Slice<byte>, bits: uint32) -> Slice<byte> {
+  let payload_start = 4
+  if pkt.length() - payload_start < 4 { return pkt }
+  let caps = binary.LittleEndian.Uint32(pkt[payload_start..payload_start + 4])
+  let cleared = caps & (bits ^ (0xFFFFFFFF as uint32))
+  let mut buf: Slice<byte> = [0, 0, 0, 0]
+  binary.LittleEndian.PutUint32(buf, cleared)
+  pkt[payload_start] = buf[0]
+  pkt[payload_start + 1] = buf[1]
+  pkt[payload_start + 2] = buf[2]
+  pkt[payload_start + 3] = buf[3]
+  pkt
+}
+
+/// Build the byte payload of a MySQL packet (header + payload) for tests and
+/// synthetic frames. `seq` is the sequence id.
+pub fn make_packet(seq: byte, payload: Slice<byte>) -> Slice<byte> {
+  let n = payload.length()
+  let mut pkt: Slice<byte> = [
+    (n & 0xFF) as byte,
+    ((n >> 8) & 0xFF) as byte,
+    ((n >> 16) & 0xFF) as byte,
+    seq,
+  ]
+  for b in payload {
+    pkt = pkt.append(b)
+  }
+  pkt
+}
