@@ -1,5 +1,69 @@
+import "go:context"
 import "go:fmt"
+import "go:os"
+import "go:os/signal"
+import "go:syscall"
+
+import "ci"
+
+const VERSION = "0.1.0"
+
+fn usage() {
+  fmt.Fprintf(os.Stderr, "sqltap — real-time SQL traffic viewer\n\nUsage:\n  sqltap serve [flags]     run the proxy daemon\n  sqltap watch <addr>      watch traffic in the TUI (e.g. localhost:9091)\n  sqltap ci <addr>         collect until SIGINT/SIGTERM, report, exit 1 on problems\n  sqltap version           show version\n")
+}
 
 fn main() {
-  fmt.Println("Hello world!")
+  let args = os.Args
+  if args.length() < 2 {
+    usage()
+    os.Exit(1)
+  }
+
+  match args[1] {
+    "serve" => run_serve(args[2..]),
+    "watch" => run_watch(args[2..]),
+    "ci" => run_ci(args[2..]),
+    "version" | "-version" | "--version" => {
+      fmt.Println(f"sqltap {VERSION}")
+    },
+    _ => {
+      usage()
+      os.Exit(1)
+    },
+  }
+}
+
+fn run_serve(args: Slice<string>) {
+  fmt.Fprintln(os.Stderr, "serve: not wired yet")
+  os.Exit(1)
+}
+
+fn run_watch(args: Slice<string>) {
+  fmt.Fprintln(os.Stderr, "watch: not wired yet")
+  os.Exit(1)
+}
+
+/// CI mode: collect events until the signal context is cancelled or the
+/// stream ends, then print the report. Exit 1 when problems were found.
+#[allow(lost_cancel)]
+fn run_ci(args: Slice<string>) {
+  if args.length() < 1 {
+    usage()
+    os.Exit(1)
+  }
+  let addr = args[0]
+  let (ctx, _) = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+
+  match ci.run(ctx, addr) {
+    Ok(result) => {
+      fmt.Print(result.report())
+      if result.has_problems() {
+        os.Exit(1)
+      }
+    },
+    Err(e) => {
+      fmt.Fprintln(os.Stderr, f"Error: {e}")
+      os.Exit(1)
+    },
+  }
 }
