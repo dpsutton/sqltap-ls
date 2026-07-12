@@ -1,0 +1,81 @@
+import "go:time"
+
+/// The type of database operation captured from the wire.
+#[json]
+#[display]
+pub enum Op {
+  Query,
+  Exec,
+  Prepare,
+  Bind,
+  Execute,
+  Begin,
+  Commit,
+  Rollback,
+}
+
+impl Op {
+  /// True for SQL-carrying operations (simple query, exec, extended-protocol
+  /// execute) — the events that count as "queries" in analytics, timelines,
+  /// transaction summaries, and EXPLAIN. False for transaction lifecycle and
+  /// protocol bookkeeping ops.
+  pub fn is_query(self) -> bool {
+    match self {
+      Op.Query | Op.Exec | Op.Execute => true,
+      Op.Prepare | Op.Bind | Op.Begin | Op.Commit | Op.Rollback => false,
+    }
+  }
+}
+
+/// How a captured query finished. A query either completes with a row count
+/// or fails with a server error message — never both.
+#[json]
+pub enum Outcome {
+  Ok { rows_affected: int64 },
+  Failed { message: string },
+}
+
+impl Outcome {
+  pub fn error_message(self) -> Option<string> {
+    match self {
+      Outcome.Ok { .. } => None,
+      Outcome.Failed { message } => Some(message),
+    }
+  }
+
+  pub fn rows(self) -> int64 {
+    match self {
+      Outcome.Ok { rows_affected } => rows_affected,
+      Outcome.Failed { .. } => 0,
+    }
+  }
+
+  pub fn is_failed(self) -> bool {
+    match self { Outcome.Failed { .. } => true, Outcome.Ok { .. } => false }
+  }
+}
+
+/// A captured database query event, as observed by the proxy.
+pub struct Event {
+  pub id: string,
+  pub op: Op,
+  pub query: string,
+  pub args: Slice<string>,
+  pub start_time: time.Time,
+  pub duration: time.Duration,
+  pub outcome: Outcome,
+  /// Transaction this event belongs to, when one is active.
+  pub tx_id: Option<string>,
+  /// Flagged by the N+1 detector.
+  pub nplus1: bool,
+  /// Duration met the slow-query threshold.
+  pub slow: bool,
+  /// Query with literals replaced by placeholders; empty when query is empty.
+  pub normalized_query: string,
+}
+
+impl Event {
+  pub fn duration_ms(self) -> float64 {
+    (self.duration.Microseconds() as float64) / 1000.0
+  }
+}

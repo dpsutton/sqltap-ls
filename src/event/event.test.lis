@@ -1,0 +1,80 @@
+import "go:encoding/json"
+import "go:time"
+
+fn sample_event() -> Event {
+  Event {
+    id: "42",
+    op: Op.Execute,
+    query: "SELECT * FROM users WHERE id = $1",
+    args: ["7"],
+    start_time: time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC),
+    duration: (1500 as time.Duration) * time.Microsecond,
+    outcome: Outcome.Ok { rows_affected: 1 },
+    tx_id: Some("tx-abc"),
+    nplus1: true,
+    slow: false,
+    normalized_query: "SELECT * FROM users WHERE id = $1",
+  }
+}
+
+#[test("wire event round-trips through JSON")]
+fn test_wire_round_trip() -> Result<(), error> {
+  let wire = WireEvent.from_event(sample_event())
+  let bytes = json.Marshal(wire)?
+
+  let mut decoded = WireEvent { op: Op.Query, .. }
+  json.Unmarshal(bytes, &decoded)?
+
+  let ev = decoded.to_event()
+  assert ev.id == "42"
+  assert ev.op == Op.Execute
+  assert ev.query == "SELECT * FROM users WHERE id = $1"
+  assert ev.args.length() == 1
+  assert ev.args[0] == "7"
+  assert ev.duration == (1500 as time.Duration) * time.Microsecond
+  assert ev.outcome.rows() == 1
+  assert !ev.outcome.is_failed()
+  let assert Some(tx) = ev.tx_id
+  assert tx == "tx-abc"
+  assert ev.nplus1
+  assert !ev.slow
+  Ok(())
+}
+
+#[test("op serializes as its bare name")]
+fn test_op_json_name() -> Result<(), error> {
+  let wire = WireEvent.from_event(sample_event())
+  let bytes = json.Marshal(wire)?
+  let text = bytes as string
+  assert text.contains("\"op\":\"Execute\"")
+  assert text.contains("\"n_plus_1\":true")
+  assert text.contains("\"tx_id\":\"tx-abc\"")
+  Ok(())
+}
+
+#[test("failed outcome maps to error field and back")]
+fn test_failed_outcome() -> Result<(), error> {
+  let mut ev = sample_event()
+  ev.outcome = Outcome.Failed { message: "relation missing" }
+  ev.tx_id = None
+
+  let wire = WireEvent.from_event(ev)
+  assert wire.error == "relation missing"
+  assert wire.rows_affected == 0
+  assert wire.tx_id == ""
+
+  let back = wire.to_event()
+  let assert Outcome.Failed { message } = back.outcome
+  assert message == "relation missing"
+  assert back.tx_id == None
+  Ok(())
+}
+
+#[test("op display and is_query")]
+fn test_op_helpers() {
+  assert f"{Op.Begin}" == "Begin"
+  assert Op.Query.is_query()
+  assert Op.Execute.is_query()
+  assert !Op.Commit.is_query()
+  assert !Op.Prepare.is_query()
+}

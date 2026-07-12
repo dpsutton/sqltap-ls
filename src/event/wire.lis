@@ -1,0 +1,62 @@
+import "go:time"
+
+/// JSON wire representation of an Event, shared by the SSE stream that both
+/// the web UI and the TUI/CI client consume. Field names and shapes match the
+/// original sql-tap web API (flat error/rows fields, milliseconds duration).
+#[json]
+pub struct WireEvent {
+  pub id: string,
+  pub op: Op,
+  pub query: string,
+  pub args: Slice<string>,
+  pub start_time: time.Time,
+  pub duration_ms: float64,
+  pub rows_affected: int64,
+  #[json(omitempty)] pub error: string,
+  #[json(omitempty)] pub tx_id: string,
+  #[json("n_plus_1", omitempty)] pub n_plus_1: bool,
+  #[json(omitempty)] pub slow_query: bool,
+  #[json(omitempty)] pub normalized_query: string,
+}
+
+impl WireEvent {
+  pub fn from_event(ev: Event) -> WireEvent {
+    WireEvent {
+      id: ev.id,
+      op: ev.op,
+      query: ev.query,
+      args: ev.args,
+      start_time: ev.start_time,
+      duration_ms: ev.duration_ms(),
+      rows_affected: ev.outcome.rows(),
+      error: ev.outcome.error_message().unwrap_or(""),
+      tx_id: ev.tx_id.unwrap_or(""),
+      n_plus_1: ev.nplus1,
+      slow_query: ev.slow,
+      normalized_query: ev.normalized_query,
+    }
+  }
+
+  pub fn to_event(self) -> Event {
+    let outcome = if self.error != "" {
+      Outcome.Failed { message: self.error }
+    } else {
+      Outcome.Ok { rows_affected: self.rows_affected }
+    }
+    let micros = (self.duration_ms * 1000.0) as int64
+    let tx_id = if self.tx_id == "" { None } else { Some(self.tx_id) }
+    Event {
+      id: self.id,
+      op: self.op,
+      query: self.query,
+      args: self.args,
+      start_time: self.start_time,
+      duration: (micros as time.Duration) * time.Microsecond,
+      outcome,
+      tx_id,
+      nplus1: self.n_plus_1,
+      slow: self.slow_query,
+      normalized_query: self.normalized_query,
+    }
+  }
+}
