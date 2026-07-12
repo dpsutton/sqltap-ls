@@ -1,0 +1,144 @@
+import "go:bufio"
+import "go:bytes"
+import "go:context"
+import "go:encoding/json"
+import "go:errors"
+import "go:io"
+import "go:net/http"
+import "go:strings"
+
+import "event"
+
+/// Prefix marking an SSE data line.
+const DATA_PREFIX = "data: "
+
+/// Buffer size for the SSE scanner. Generous so that long queries on a single
+/// line are not truncated (bufio's default max token is 64KB).
+const SCAN_BUFFER = 1024 * 1024
+
+/// Normalize a daemon address into a base URL. A bare "host:port" becomes
+/// "http://host:port"; anything already starting with "http://" is kept.
+fn base_url(addr: string) -> string {
+  if strings.HasPrefix(addr, "http://") { addr } else { f"http://{addr}" }
+}
+
+/// Parse a single line from the SSE stream into an event.
+///
+/// Returns `None` for blank lines, lines that do not begin with "data: ", and
+/// lines whose payload is not valid `WireEvent` JSON — the caller skips these.
+pub fn parse_sse_line(line: string) -> Option<event.Event> {
+  if !strings.HasPrefix(line, DATA_PREFIX) {
+    return None
+  }
+  let payload = strings.TrimPrefix(line, DATA_PREFIX)
+  let mut wire = event.WireEvent { op: event.Op.Query, .. }
+  match json.Unmarshal(payload as Slice<byte>, &wire) {
+    Ok(_) => Some(wire.to_event()),
+    Err(_) => None,
+  }
+}
+
+/// Open the daemon's SSE event stream at `addr`.
+///
+/// Builds a GET /api/events request bound to `ctx`, verifies a 200 response,
+/// then spawns a task that scans the body line-by-line and forwards parsed
+/// events on a buffered channel. The channel closes on stream end, ctx
+/// cancellation, or a scan error — that closure is the consumer's termination
+/// signal. Returns the receive end synchronously once the request succeeds.
+pub fn watch(
+  ctx: context.Context,
+  addr: string,
+) -> Result<Channel<event.Event>, error> {
+  let url = f"{base_url(addr)}/api/events"
+  let req = http.NewRequestWithContext(ctx, http.MethodGet, url, None)?
+  let resp = http.DefaultClient.Do(req)?
+  let Some(body) = resp.Body else {
+    return Err(errors.New(f"watch {url}: empty response body"))
+  }
+  if resp.StatusCode != http.StatusOK {
+    let _ = body.Close()
+    return Err(errors.New(f"watch {url}: unexpected status {resp.StatusCode}"))
+  }
+
+  let ch = Channel.buffered<event.Event>(256)
+  task {
+    defer body.Close()
+    defer ch.close()
+    let scanner = bufio.NewScanner(body)
+    let mut buf: Slice<byte> = []
+    scanner.Buffer(buf, SCAN_BUFFER)
+    while scanner.Scan() {
+      if let Some(ev) = parse_sse_line(scanner.Text()) {
+        let _ = ch.send(ev)
+      }
+    }
+  }
+  Ok(ch)
+}
+
+/// JSON body of an /api/explain request.
+#[json]
+struct ExplainRequest {
+  query: string,
+  args: Slice<string>,
+  analyze: bool,
+}
+
+/// Successful /api/explain response.
+#[json]
+struct ExplainOk {
+  plan: string,
+}
+
+/// Failed /api/explain response.
+#[json]
+struct ExplainError {
+  #[json(omitempty)]
+  error: string,
+}
+
+/// Request an EXPLAIN (optionally ANALYZE) plan for `query` from the daemon.
+///
+/// On a non-200 response, the server's `{"error": ...}` message is returned as
+/// the error.
+pub fn explain(
+  ctx: context.Context,
+  addr: string,
+  query: string,
+  args: Slice<string>,
+  analyze: bool,
+) -> Result<string, error> {
+  let url = f"{base_url(addr)}/api/explain"
+  let payload = ExplainRequest { query, args, analyze }
+  let body_bytes = json.Marshal(payload)?
+  let reader = bytes.NewReader(body_bytes)
+  let req = http.NewRequestWithContext(ctx, http.MethodPost, url, reader)?
+  req.Header.Set("Content-Type", "application/json")
+
+  let resp = http.DefaultClient.Do(req)?
+  let Some(resp_body) = resp.Body else {
+    return Err(errors.New("explain: empty response body"))
+  }
+  defer resp_body.Close()
+  let data = match io.ReadAll(resp_body) {
+    Partial.Ok(d) => d,
+    Partial.Both(d, _) => d,
+    Partial.Err(e) => { return Err(e) },
+  }
+
+  if resp.StatusCode != http.StatusOK {
+    let mut fail = ExplainError { error: "" }
+    // Best-effort: a malformed error body falls through to the status message.
+    let _ = json.Unmarshal(data, &fail)
+    let msg = if fail.error != "" {
+      fail.error
+    } else {
+      f"explain: unexpected status {resp.StatusCode}"
+    }
+    return Err(errors.New(msg))
+  }
+
+  let mut ok = ExplainOk { plan: "" }
+  json.Unmarshal(data, &ok)?
+  Ok(ok.plan)
+}

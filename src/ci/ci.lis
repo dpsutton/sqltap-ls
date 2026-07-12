@@ -1,0 +1,192 @@
+import "go:context"
+import "go:slices"
+import "go:strings"
+import "go:time"
+
+import "client"
+import "event"
+
+/// A performance problem detected across a batch of captured queries.
+///
+/// Average duration is meaningful only for slow queries, so it lives on the
+/// `Slow` variant rather than as a nullable field beside a kind tag.
+pub enum Problem {
+  NPlus1 { query: string, count: int },
+  Slow { query: string, count: int, avg: time.Duration },
+}
+
+impl Problem {
+  /// The grouping key (normalized-or-raw query) this problem was reported for.
+  fn query_key(self) -> string {
+    match self {
+      Problem.NPlus1 { query, .. } => query,
+      Problem.Slow { query, .. } => query,
+    }
+  }
+
+  /// How many flagged events contributed to this problem.
+  fn occurrences(self) -> int {
+    match self {
+      Problem.NPlus1 { count, .. } => count,
+      Problem.Slow { count, .. } => count,
+    }
+  }
+
+  /// N+1 problems sort before slow problems (matching Go's "N+1" < "SLOW").
+  fn kind_rank(self) -> int {
+    match self {
+      Problem.NPlus1 { .. } => 0,
+      Problem.Slow { .. } => 1,
+    }
+  }
+
+  /// One report line, matching the Go formatter byte-for-byte.
+  fn report_line(self) -> string {
+    match self {
+      Problem.NPlus1 { query, count } => f"  [N+1]  {query}  (detected {count} times)\n",
+      Problem.Slow { query, count, avg } => {
+        let truncated = avg.Truncate(time.Millisecond)
+        f"  [SLOW] {query}  (avg {truncated}, {count} occurrences)\n"
+      },
+    }
+  }
+}
+
+/// The outcome of a CI run: total queries seen and any problems detected.
+pub struct CiResult {
+  pub total: int,
+  pub problems: Slice<Problem>,
+}
+
+impl CiResult {
+  /// Whether any problems were detected.
+  pub fn has_problems(self) -> bool {
+    !self.problems.is_empty()
+  }
+
+  /// Human-readable report, matching the Go `Report()` output byte-for-byte.
+  pub fn report(self) -> string {
+    let mut b = strings.Builder {}
+    b.WriteString("sql-tap CI Report\n")
+    b.WriteString("=================\n")
+    b.WriteString(f"Captured: {self.total} queries\n")
+
+    if !self.has_problems() {
+      b.WriteString("\nNo problems found.\n")
+      return b.String()
+    }
+
+    b.WriteString("\nProblems found:\n")
+    for p in self.problems {
+      b.WriteString(p.report_line())
+    }
+
+    let n = self.problems.length()
+    b.WriteString(f"\nExit: 1 ({n} problems found)\n")
+    b.String()
+  }
+}
+
+/// Mutable per-query tallies accumulated while scanning events.
+///
+/// Durations sum as raw nanoseconds (`int64`) so the averaging arithmetic stays
+/// in a plain numeric type; the result is cast back to `time.Duration`.
+struct QueryStats {
+  nplus1_count: int,
+  slow_count: int,
+  total_ns: int64,
+}
+
+/// The grouping key for an event: normalized query if present, else raw query.
+fn group_key(e: event.Event) -> string {
+  if e.normalized_query != "" { e.normalized_query } else { e.query }
+}
+
+/// Aggregate events into a CI result.
+///
+/// `total` counts every event. Only events flagged nplus1 or slow are grouped
+/// (by `group_key`). Each group emits an `NPlus1` problem when any of its
+/// events are nplus1-flagged and, independently, a `Slow` problem when any are
+/// slow-flagged (with avg = sum of flagged durations / slow count).
+///
+/// Problems are sorted N+1-before-SLOW, then count descending, then query
+/// ascending. The final query tie-break is a deliberate deviation from Go
+/// (whose ties were map-iteration-ordered) for deterministic output.
+pub fn aggregate(events: Slice<event.Event>) -> CiResult {
+  let mut keys: Slice<string> = []
+  let mut grouped: Map<string, QueryStats> = Map.new()
+  let mut total = 0
+
+  for e in events {
+    total += 1
+    if !e.nplus1 && !e.slow {
+      continue
+    }
+    let key = group_key(e)
+    let mut stats = grouped.get(key).unwrap_or_else(|| {
+      keys = keys.append(key)
+      QueryStats { .. }
+    })
+    if e.nplus1 {
+      stats.nplus1_count += 1
+    }
+    if e.slow {
+      stats.slow_count += 1
+      stats.total_ns += e.duration as int64
+    }
+    grouped[key] = stats
+  }
+
+  let mut problems: Slice<Problem> = []
+  for key in keys {
+    let Some(stats) = grouped.get(key) else {
+      continue
+    }
+    if stats.nplus1_count > 0 {
+      problems = problems.append(
+        Problem.NPlus1 { query: key, count: stats.nplus1_count },
+      )
+    }
+    if stats.slow_count > 0 {
+      let avg_ns = stats.total_ns / (stats.slow_count as int64)
+      let avg = avg_ns as time.Duration
+      problems = problems.append(
+        Problem.Slow { query: key, count: stats.slow_count, avg },
+      )
+    }
+  }
+
+  let sorted = sort_problems(problems)
+  CiResult { total, problems: sorted }
+}
+
+/// Sort problems N+1-before-SLOW, then count descending, then query ascending
+/// (the query tie-break is a deterministic deviation from Go's map ordering).
+fn sort_problems(problems: Slice<Problem>) -> Slice<Problem> {
+  let out = problems.clone()
+  slices.SortStableFunc(out, compare_problems)
+  out
+}
+
+/// Ordering of two problems: negative if `a` sorts first, positive if `b` does.
+fn compare_problems(a: Problem, b: Problem) -> int {
+  if a.kind_rank() != b.kind_rank() {
+    return a.kind_rank() - b.kind_rank()
+  }
+  if a.occurrences() != b.occurrences() {
+    // Higher count first.
+    return b.occurrences() - a.occurrences()
+  }
+  strings.Compare(a.query_key(), b.query_key())
+}
+
+/// Connect to the daemon at `addr`, collect events until the stream closes
+/// (ctx cancellation closes it upstream), and return the aggregated result.
+pub fn run(ctx: context.Context, addr: string) -> Result<CiResult, error> {
+  let events_ch = client.watch(ctx, addr)?
+  let mut events: Slice<event.Event> = []
+  for e in events_ch {
+    events = events.append(e)
+  }
+  Ok(aggregate(events))
+}

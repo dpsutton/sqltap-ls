@@ -1,0 +1,180 @@
+import "go:strings"
+import "go:time"
+
+import "event"
+
+/// Build a test event with the given grouping fields and flags.
+fn make_event(
+  query: string,
+  normalized: string,
+  nplus1: bool,
+  slow: bool,
+  dur: time.Duration,
+) -> event.Event {
+  event.Event {
+    id: "",
+    op: event.Op.Query,
+    query,
+    args: [],
+    start_time: time.Time {},
+    duration: dur,
+    outcome: event.Outcome.Ok { rows_affected: 0 },
+    tx_id: None,
+    nplus1,
+    slow,
+    normalized_query: normalized,
+  }
+}
+
+#[test]
+fn has_problems_false_when_empty() {
+  let r = CiResult { total: 10, problems: [] }
+  assert !r.has_problems()
+}
+
+#[test]
+fn has_problems_true_with_problems() {
+  let r = CiResult {
+    total: 10,
+    problems: [Problem.NPlus1 { query: "SELECT 1", count: 5 }],
+  }
+  assert r.has_problems()
+}
+
+#[test]
+fn report_no_problems() {
+  let r = CiResult { total: 42, problems: [] }
+  let report = r.report()
+  assert strings.Contains(report, "Captured: 42 queries")
+  assert strings.Contains(report, "No problems found.")
+}
+
+#[test]
+fn report_with_problems() {
+  let avg = (523 as time.Duration) * time.Millisecond
+  let r = CiResult {
+    total: 100,
+    problems: [
+      Problem.NPlus1 {
+        query: "SELECT * FROM comments WHERE post_id = ?",
+        count: 12,
+      },
+      Problem.Slow { query: "SELECT * FROM users JOIN ...", count: 3, avg },
+    ],
+  }
+  let report = r.report()
+  assert strings.Contains(report, "Captured: 100 queries")
+  assert strings.Contains(report, "[N+1]")
+  assert strings.Contains(report, "detected 12 times")
+  assert strings.Contains(report, "[SLOW]")
+  assert strings.Contains(report, "avg 523ms")
+  assert strings.Contains(report, "2 problems found")
+}
+
+#[test]
+fn aggregate_groups_and_sorts() {
+  let ms = time.Millisecond
+  let events = [
+    make_event("SELECT 1", "SELECT ?", false, false, 0 as time.Duration),
+    make_event(
+      "SELECT * FROM users WHERE id = 1",
+      "SELECT * FROM users WHERE id = ?",
+      true,
+      false,
+      0 as time.Duration,
+    ),
+    make_event(
+      "SELECT * FROM users WHERE id = 2",
+      "SELECT * FROM users WHERE id = ?",
+      true,
+      false,
+      0 as time.Duration,
+    ),
+    make_event(
+      "SELECT * FROM users WHERE id = 3",
+      "SELECT * FROM users WHERE id = ?",
+      true,
+      false,
+      0 as time.Duration,
+    ),
+    make_event(
+      "SELECT * FROM posts JOIN comments ON ...",
+      "SELECT * FROM posts JOIN comments ON ...",
+      false,
+      true,
+      (200 as time.Duration) * ms,
+    ),
+    make_event(
+      "SELECT * FROM posts JOIN comments ON ...",
+      "SELECT * FROM posts JOIN comments ON ...",
+      false,
+      true,
+      (400 as time.Duration) * ms,
+    ),
+  ]
+
+  let result = aggregate(events)
+  assert result.total == 6
+  assert result.problems.length() == 2
+
+  let p0 = result.problems[0]
+  let assert Problem.NPlus1 { count, .. } = p0
+  assert count == 3
+
+  let p1 = result.problems[1]
+  let assert Problem.Slow { count: slow_count, avg, .. } = p1
+  assert slow_count == 2
+  assert avg == (300 as time.Duration) * ms
+}
+
+#[test]
+fn aggregate_no_problem_events() {
+  let events = [
+    make_event("SELECT 1", "", false, false, 0 as time.Duration),
+    make_event(
+      "INSERT INTO users VALUES (1)",
+      "",
+      false,
+      false,
+      0 as time.Duration,
+    ),
+  ]
+  let result = aggregate(events)
+  assert result.total == 2
+  assert !result.has_problems()
+}
+
+#[test]
+fn aggregate_empty() {
+  let events: Slice<event.Event> = []
+  let result = aggregate(events)
+  assert result.total == 0
+  assert !result.has_problems()
+}
+
+#[test]
+fn aggregate_both_nplus1_and_slow() {
+  let events = [
+    make_event(
+      "SELECT * FROM users WHERE id = ?",
+      "SELECT * FROM users WHERE id = ?",
+      true,
+      true,
+      (150 as time.Duration) * time.Millisecond,
+    ),
+  ]
+  let result = aggregate(events)
+  assert result.problems.length() == 2
+}
+
+#[test]
+fn aggregate_uses_raw_query_when_normalized_empty() {
+  let raw = "SELECT id, name FROM users"
+  let events = [
+    make_event(raw, "", true, false, 0 as time.Duration),
+    make_event(raw, "", true, false, 0 as time.Duration),
+  ]
+  let result = aggregate(events)
+  assert result.problems.length() == 1
+  assert result.problems[0].query_key() == raw
+}
