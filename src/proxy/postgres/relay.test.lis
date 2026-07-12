@@ -1,0 +1,221 @@
+import "event"
+import "go:context"
+import "go:encoding/binary"
+import "go:io"
+import "go:net"
+import "go:time"
+
+// End-to-end relay tests drive a real loopback proxy against a fake in-process
+// PostgreSQL upstream. No container, no sleeps: the fake server speaks just
+// enough of the protocol to complete startup and answer one simple query, and
+// the test synchronizes on the captured event arriving on the channel.
+
+/// Build a framed message: type byte + int32 length (incl. itself) + payload.
+fn frame(type_byte: byte, payload: Slice<byte>) -> Slice<byte> {
+  let len = (4 + payload.length()) as uint32
+  let mut lenb: Slice<byte> = [0, 0, 0, 0]
+  binary.BigEndian.PutUint32(lenb, len)
+  let mut out: Slice<byte> = [type_byte]
+  for b in lenb {
+    out = out.append(b)
+  }
+  for b in payload {
+    out = out.append(b)
+  }
+  out
+}
+
+fn cstring_bytes(s: string) -> Slice<byte> {
+  let mut out: Slice<byte> = []
+  for b in (s as Slice<byte>) {
+    out = out.append(b)
+  }
+  out.append(0)
+}
+
+/// Read a startup-format message (4-byte length + payload) from a raw conn.
+fn read_startup(conn: net.Conn) -> Result<Slice<byte>, error> {
+  let mut hdr: Slice<byte> = [0, 0, 0, 0]
+  read_full(conn, hdr)?
+  let n = binary.BigEndian.Uint32(hdr) as int
+  let mut rest: Slice<byte> = []
+  for _ in 0..(n - 4) {
+    rest = rest.append(0)
+  }
+  if rest.length() > 0 {
+    read_full(conn, rest)?
+  }
+  let mut full = hdr.clone()
+  for b in rest {
+    full = full.append(b)
+  }
+  Ok(full)
+}
+
+/// Read a framed message (type + int32 length + payload) from a raw conn.
+fn read_framed(conn: net.Conn) -> Result<Slice<byte>, error> {
+  let mut hdr: Slice<byte> = [0, 0, 0, 0, 0]
+  read_full(conn, hdr)?
+  let n = binary.BigEndian.Uint32(hdr[1..5]) as int
+  let mut rest: Slice<byte> = []
+  for _ in 0..(n - 4) {
+    rest = rest.append(0)
+  }
+  if rest.length() > 0 {
+    read_full(conn, rest)?
+  }
+  let mut full = hdr.clone()
+  for b in rest {
+    full = full.append(b)
+  }
+  Ok(full)
+}
+
+/// A minimal fake PostgreSQL server: completes startup with AuthenticationOk +
+/// ReadyForQuery, then for the first simple query replies with CommandComplete
+/// and ReadyForQuery. Runs on a loopback listener; returns its address.
+fn start_fake_upstream(command_tag: string) -> Result<(net.Listener, string), error> {
+  let mut lc = net.ListenConfig { .. }
+  let listener = lc.Listen(context.Background(), "tcp", "127.0.0.1:0")?
+  let addr = match listener.Addr() {
+    Some(a) => a.String(),
+    None => "",
+  }
+
+  task {
+    match listener.Accept() {
+      Ok(conn) => { let _ = serve_fake(conn, command_tag) },
+      Err(_) => {},
+    }
+  }
+
+  Ok((listener, addr))
+}
+
+fn serve_fake(conn: net.Conn, command_tag: string) -> Result<(), error> {
+  // Read the StartupMessage (skipping any SSLRequest that the proxy declines
+  // on its own — the proxy never forwards SSLRequest upstream).
+  let _startup = read_startup(conn)?
+
+  // AuthenticationOk: 'R' + int32(0).
+  let mut auth_ok: Slice<byte> = [0, 0, 0, 0]
+  binary.BigEndian.PutUint32(auth_ok, AUTH_TYPE_OK)
+  write_all(conn, frame(ascii('R'), auth_ok))?
+
+  // ReadyForQuery: 'Z' + status byte 'I' (idle).
+  write_all(conn, frame(ascii('Z'), [ascii('I')]))?
+
+  // Serve queries: for each simple query, reply CommandComplete + ReadyForQuery.
+  loop {
+    let msg = match read_framed(conn) {
+      Ok(m) => m,
+      Err(_) => return Ok(()),
+    }
+    if msg[0] == ascii('Q') {
+      write_all(conn, frame(ascii('C'), cstring_bytes(command_tag)))?
+      write_all(conn, frame(ascii('Z'), [ascii('I')]))?
+    } else if msg[0] == ascii('X') {
+      return Ok(())
+    }
+  }
+}
+
+#[test("simple query relays end-to-end and captures a completed event")]
+fn test_relay_simple_query() -> Result<(), error> {
+  let (up_listener, up_addr) = start_fake_upstream("SELECT 1")?
+  defer up_listener.Close()
+
+  let events = Channel.buffered<event.Event>(16)
+  let (ctx, cancel) = context.WithCancel(context.Background())
+  defer cancel()
+
+  // Bind the proxy to an ephemeral loopback port.
+  let mut lc = net.ListenConfig { .. }
+  let probe = lc.Listen(ctx, "tcp", "127.0.0.1:0")?
+  let proxy_addr = match probe.Addr() {
+    Some(a) => a.String(),
+    None => "",
+  }
+  probe.Close()
+
+  task {
+    let _ = listen_and_serve(ctx, proxy_addr, up_addr, events)
+  }
+
+  // Dial the proxy as a client, retrying until it is listening.
+  let mut dialer = net.Dialer { .. }
+  let mut client = match dial_retry(&dialer, ctx, proxy_addr) {
+    Ok(c) => c,
+    Err(e) => return Err(e),
+  }
+  defer client.Close()
+
+  // Minimal client handshake: StartupMessage (protocol 3.0, user=test).
+  write_all(client, startup_message())?
+  // Read AuthenticationOk then ReadyForQuery.
+  let _auth = read_framed(client)?
+  let _rfq = read_framed(client)?
+
+  // Simple query.
+  write_all(client, frame(ascii('Q'), cstring_bytes("SELECT 1")))?
+  // Drain the CommandComplete + ReadyForQuery the fake sends back.
+  let _cc = read_framed(client)?
+  let _rfq2 = read_framed(client)?
+
+  // The proxy should have captured and emitted the event.
+  let assert Some(ev) = recv_timeout(events, 3 * time.Second)
+  assert ev.query == "SELECT 1"
+  assert !ev.outcome.is_failed()
+  assert ev.outcome.rows() == 1
+  Ok(())
+}
+
+/// StartupMessage: int32 length + int32 protocol(196608) + "user\0test\0" + \0.
+fn startup_message() -> Slice<byte> {
+  let mut params: Slice<byte> = []
+  for b in cstring_bytes("user") {
+    params = params.append(b)
+  }
+  for b in cstring_bytes("test") {
+    params = params.append(b)
+  }
+  params = params.append(0) // terminating empty string
+
+  let total = (4 + 4 + params.length()) as uint32
+  let mut out: Slice<byte> = [0, 0, 0, 0]
+  binary.BigEndian.PutUint32(out, total)
+  let mut proto: Slice<byte> = [0, 0, 0, 0]
+  binary.BigEndian.PutUint32(proto, 196608)
+  for b in proto {
+    out = out.append(b)
+  }
+  for b in params {
+    out = out.append(b)
+  }
+  out
+}
+
+fn dial_retry(
+  dialer: Ref<net.Dialer>,
+  ctx: context.Context,
+  addr: string,
+) -> Result<net.Conn, error> {
+  let mut last: error = mk_error("dial: never attempted")
+  for _ in 0..50 {
+    match dialer.DialContext(ctx, "tcp", addr) {
+      Ok(c) => return Ok(c),
+      Err(e) => {
+        last = e
+        time.Sleep(20 * time.Millisecond)
+      },
+    }
+  }
+  Err(last)
+}
+
+fn recv_timeout(ch: Channel<event.Event>, d: time.Duration) -> Option<event.Event> {
+  select {
+    let Some(ev) = ch.receive() => Some(ev),
+    let _ = time.After(d).receive() => None,
+  }
+}

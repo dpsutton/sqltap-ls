@@ -1,0 +1,211 @@
+import "go:encoding/binary"
+import "go:net"
+import "go:time"
+
+import "event"
+
+// ---- helpers to build message payloads (type byte + length stripped) ----
+
+fn append_cstring(buf: Slice<byte>, s: string) -> Slice<byte> {
+  let mut out = buf.clone()
+  for b in (s as Slice<byte>) {
+    out = out.append(b)
+  }
+  out.append(0)
+}
+
+fn append_be16(buf: Slice<byte>, v: int16) -> Slice<byte> {
+  let mut tmp: Slice<byte> = [0, 0]
+  binary.BigEndian.PutUint16(tmp, v as uint16)
+  let mut out = buf.clone()
+  for b in tmp {
+    out = out.append(b)
+  }
+  out
+}
+
+fn append_be32(buf: Slice<byte>, v: uint32) -> Slice<byte> {
+  let mut tmp: Slice<byte> = [0, 0, 0, 0]
+  binary.BigEndian.PutUint32(tmp, v)
+  let mut out = buf.clone()
+  for b in tmp {
+    out = out.append(b)
+  }
+  out
+}
+
+fn parse_payload(name: string, query: string, oids: Slice<uint32>) -> Slice<byte> {
+  let mut buf: Slice<byte> = []
+  buf = append_cstring(buf, name)
+  buf = append_cstring(buf, query)
+  buf = append_be16(buf, oids.length() as int16)
+  for oid in oids {
+    buf = append_be32(buf, oid)
+  }
+  buf
+}
+
+fn describe_payload(name: string) -> Slice<byte> {
+  let mut buf: Slice<byte> = [ascii('S')]
+  append_cstring(buf, name)
+}
+
+fn param_desc_payload(oids: Slice<uint32>) -> Slice<byte> {
+  let mut buf: Slice<byte> = []
+  buf = append_be16(buf, oids.length() as int16)
+  for oid in oids {
+    buf = append_be32(buf, oid)
+  }
+  buf
+}
+
+/// Bind with a single binary parameter carrying `raw` bytes.
+fn bind_one_binary(stmt: string, raw: Slice<byte>) -> Slice<byte> {
+  let mut buf: Slice<byte> = []
+  buf = append_cstring(buf, "")
+  // portal
+  buf = append_cstring(buf, stmt)
+  buf = append_be16(buf, 1)
+  // one format code
+  buf = append_be16(buf, 1)
+  // binary
+  buf = append_be16(buf, 1)
+  // one parameter
+  buf = append_be32(buf, raw.length() as uint32)
+  let mut out = buf.clone()
+  for b in raw {
+    out = out.append(b)
+  }
+  out
+}
+
+/// A Conn wired over an in-memory pipe. The sockets are never read from in
+/// capture-only tests; they exist only to satisfy the constructor.
+fn test_conn() -> Conn {
+  let (a, b) = net.Pipe()
+  let events = Channel.buffered<event.Event>(16)
+  Conn.new(a, b, events)
+}
+
+#[test("unnamed bind picks up ParameterDescription OIDs")]
+fn test_unnamed_bind_uses_param_desc_oids() {
+  let mut c = test_conn()
+  handle_parse(&c, parse_payload("", "SELECT id FROM t WHERE ts < $1", [0]))
+  handle_describe(&c, describe_payload(""))
+  handle_parameter_description(&c, param_desc_payload([OID_TIMESTAMP_TZ]))
+  handle_bind(&c, bind_one_binary("", encode_micros(826159500119733)))
+
+  assert c.last_bind_args.length() == 1
+  let assert Ok(_) = time.Parse(time.RFC3339Nano, c.last_bind_args[0])
+}
+
+#[test("named statement uses per-statement OIDs")]
+fn test_named_stmt_oids() {
+  let mut c = test_conn()
+  handle_parse(&c, parse_payload("s1", "SELECT id FROM t WHERE ts < $1", [0]))
+  handle_describe(&c, describe_payload("s1"))
+  handle_parameter_description(&c, param_desc_payload([OID_TIMESTAMP]))
+  handle_bind(&c, bind_one_binary("s1", encode_micros(826159500119733)))
+
+  assert c.last_bind_args.length() == 1
+  let assert Ok(_) = time.Parse(time.RFC3339Nano, c.last_bind_args[0])
+}
+
+#[test("named statement OIDs do not pollute an unnamed bind")]
+fn test_named_does_not_pollute_unnamed() {
+  let mut c = test_conn()
+  handle_parse(&c, parse_payload("", "SELECT id FROM t WHERE id = $1", [0]))
+  handle_parse(&c, parse_payload("s1", "SELECT id FROM t WHERE ts < $1", [0]))
+  handle_describe(&c, describe_payload("s1"))
+  handle_parameter_description(&c, param_desc_payload([OID_TIMESTAMP]))
+  handle_bind(&c, bind_one_binary("", encode_micros(42)))
+
+  assert c.last_bind_args.length() == 1
+  // OID=0 with 8-byte binary -> plain int64, not a timestamp.
+  assert c.last_bind_args[0] == "42"
+}
+
+#[test("ReadyForQuery drains stale pending describes")]
+fn test_ready_for_query_drains() {
+  let mut c = test_conn()
+  handle_parse(&c, parse_payload("", "INVALID SQL", [0]))
+  handle_describe(&c, describe_payload(""))
+  // Simulate ReadyForQuery clearing the queue.
+  c.pending_describes = []
+
+  handle_parse(&c, parse_payload("", "SELECT id FROM t WHERE ts < $1", [0]))
+  handle_describe(&c, describe_payload(""))
+  handle_parameter_description(&c, param_desc_payload([OID_TIMESTAMP_TZ]))
+  handle_bind(&c, bind_one_binary("", encode_micros(826159500119733)))
+
+  assert c.last_bind_args.length() == 1
+  let assert Ok(_) = time.Parse(time.RFC3339Nano, c.last_bind_args[0])
+}
+
+#[test("simple query starts a pending event with op Query")]
+fn test_simple_query_pending() {
+  let mut c = test_conn()
+  handle_simple_query(&c, append_cstring([], "SELECT 1"))
+  let assert Some(ev) = c.pending
+  assert ev.query == "SELECT 1"
+  assert ev.op == event.Op.Query
+  assert ev.id == "1"
+}
+
+#[test("command complete finalizes the pending event and emits it")]
+fn test_command_complete_emits() {
+  let mut c = test_conn()
+  handle_simple_query(&c, append_cstring([], "INSERT INTO t VALUES (1)"))
+  // 'C' CommandComplete payload: the tag as a cstring.
+  handle_command_complete(&c, append_cstring([], "INSERT 0 3"))
+
+  assert c.pending.is_none()
+  let assert Some(ev) = c.events.receive()
+  assert ev.query == "INSERT INTO t VALUES (1)"
+  assert ev.outcome.rows() == 3
+  assert !ev.outcome.is_failed()
+}
+
+#[test("error response finalizes the pending event as failed")]
+fn test_error_response_emits() {
+  let mut c = test_conn()
+  handle_simple_query(&c, append_cstring([], "SELECT bad"))
+
+  let mut payload: Slice<byte> = [ascii('M')]
+  payload = append_cstring(payload, "column does not exist")
+  payload = payload.append(0)
+  handle_error_response(&c, payload)
+
+  let assert Some(ev) = c.events.receive()
+  assert ev.outcome.is_failed()
+  let assert Some(msg) = ev.outcome.error_message()
+  assert msg == "column does not exist"
+}
+
+#[test("execute resolves a named prepared query and carries bind args")]
+fn test_execute_named_query() {
+  let mut c = test_conn()
+  handle_parse(&c, parse_payload("s1", "SELECT $1::int + $2::int", [0, 0]))
+  // Bind two text params to s1.
+  let mut bind: Slice<byte> = []
+  bind = append_cstring(bind, "")
+  // portal
+  bind = append_cstring(bind, "s1")
+  bind = append_be16(bind, 0)
+  // zero format codes -> text
+  bind = append_be16(bind, 2)
+  // two params
+  bind = append_be32(bind, 1)
+  bind = bind.append(ascii('1'))
+  bind = append_be32(bind, 1)
+  bind = bind.append(ascii('2'))
+  handle_bind(&c, bind)
+
+  handle_execute(&c)
+  let assert Some(ev) = c.pending
+  assert ev.op == event.Op.Execute
+  assert ev.query == "SELECT $1::int + $2::int"
+  assert ev.args.length() == 2
+  assert ev.args[0] == "1"
+  assert ev.args[1] == "2"
+}

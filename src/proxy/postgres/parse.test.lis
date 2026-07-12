@@ -1,0 +1,150 @@
+import "go:encoding/binary"
+import "go:time"
+
+/// Encode microseconds as big-endian 8 bytes (PostgreSQL binary timestamp).
+fn encode_micros(us: int64) -> Slice<byte> {
+  let mut b: Slice<byte> = []
+  for _ in 0..8 {
+    b = b.append(0)
+  }
+  binary.BigEndian.PutUint64(b, us as uint64)
+  b
+}
+
+fn encode_be32(v: uint32) -> Slice<byte> {
+  let mut b: Slice<byte> = []
+  for _ in 0..4 {
+    b = b.append(0)
+  }
+  binary.BigEndian.PutUint32(b, v)
+  b
+}
+
+#[test("rows-affected parses the last token of a command tag")]
+fn test_parse_rows_affected() {
+  assert parse_rows_affected("INSERT 0 5") == 5
+  assert parse_rows_affected("SELECT 3") == 3
+  assert parse_rows_affected("UPDATE 10") == 10
+  assert parse_rows_affected("CREATE TABLE") == 0
+  assert parse_rows_affected("") == 0
+}
+
+#[test("timestamp OIDs decode 8-byte binary params as RFC3339")]
+fn test_decode_binary_timestamp() {
+  let data = encode_micros(826159500119733)
+
+  let ts = decode_binary_param(data, OID_TIMESTAMP)
+  let assert Ok(_) = time.Parse(time.RFC3339Nano, ts)
+
+  let tstz = decode_binary_param(data, OID_TIMESTAMP_TZ)
+  let assert Ok(_) = time.Parse(time.RFC3339Nano, tstz)
+}
+
+#[test("zero OID 8-byte value decodes as a plain int64")]
+fn test_decode_binary_int64() {
+  let data = encode_micros(826159500119733)
+  assert decode_binary_param(data, 0) == "826159500119733"
+}
+
+#[test("4-byte and 2-byte and 1-byte ints decode by length")]
+fn test_decode_binary_short_ints() {
+  assert decode_binary_param(encode_be32(42), 0) == "42"
+  // int16 = -1 (0xFFFF)
+  let ff16: Slice<byte> = [0xff, 0xff]
+  assert decode_binary_param(ff16, 0) == "-1"
+  // int8 = -1 (0xFF)
+  let ff8: Slice<byte> = [0xff]
+  assert decode_binary_param(ff8, 0) == "-1"
+}
+
+#[test("16-byte value formats as a canonical lowercase UUID")]
+fn test_decode_binary_uuid() {
+  let bytes: Slice<byte> = [
+    0x12,
+    0x34,
+    0x56,
+    0x78,
+    0x9a,
+    0xbc,
+    0xde,
+    0xf0,
+    0x11,
+    0x22,
+    0x33,
+    0x44,
+    0x55,
+    0x66,
+    0x77,
+    0x88,
+  ]
+  assert decode_binary_param(bytes, 0) == "12345678-9abc-def0-1122-334455667788"
+}
+
+#[test("pg timestamp micros round-trips through the pg epoch")]
+fn test_decode_pg_timestamp_micros() {
+  let pg_epoch = time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
+
+  let assert Ok(zero) = time.Parse(
+    time.RFC3339Nano,
+    decode_pg_timestamp_micros(0),
+  )
+  assert zero.Equal(pg_epoch)
+
+  // Negative whole second: one second before the epoch.
+  let assert Ok(neg) = time.Parse(
+    time.RFC3339Nano,
+    decode_pg_timestamp_micros(-1000000),
+  )
+  let want = time.Date(1999, time.December, 31, 23, 59, 59, 0, time.UTC)
+  assert neg.Equal(want)
+
+  // Negative fractional microsecond borrows correctly.
+  let assert Ok(negfrac) = time.Parse(
+    time.RFC3339Nano,
+    decode_pg_timestamp_micros(-1),
+  )
+  let want2 = time.Date(
+    1999,
+    time.December,
+    31,
+    23,
+    59,
+    59,
+    999999000,
+    time.UTC,
+  )
+  assert negfrac.Equal(want2)
+}
+
+#[test("format-code resolution follows the single/per-index protocol rule")]
+fn test_is_binary_format() {
+  // No codes: all text.
+  assert !is_binary_format([], 0)
+  assert !is_binary_format([], 3)
+  // One code applies to every parameter.
+  assert is_binary_format([1], 0)
+  assert is_binary_format([1], 5)
+  assert !is_binary_format([0], 2)
+  // Per-index codes.
+  assert is_binary_format([0, 1, 0], 1)
+  assert !is_binary_format([0, 1, 0], 0)
+  assert !is_binary_format([0, 1], 5)
+}
+
+#[test("error-response payload yields the M field message")]
+fn test_parse_error_message() {
+  // Fields: S "ERROR", M "boom", then terminator.
+  let mut buf: Slice<byte> = []
+  buf = buf.append(ascii('S'))
+  for b in ("ERROR" as Slice<byte>) {
+    buf = buf.append(b)
+  }
+  buf = buf.append(0)
+  buf = buf.append(ascii('M'))
+  for b in ("boom" as Slice<byte>) {
+    buf = buf.append(b)
+  }
+  buf = buf.append(0)
+  buf = buf.append(0)
+  assert parse_error_message(buf) == "boom"
+}

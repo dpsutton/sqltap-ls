@@ -1,0 +1,85 @@
+import "go:context"
+import "go:log"
+import "go:net"
+
+import "event"
+
+/// Start accepting client connections on `listen_addr` and relaying each to
+/// `upstream_addr`, emitting captured query events into `events`.
+///
+/// A watcher task closes the listener when `ctx` is cancelled, unblocking
+/// Accept. Each accepted connection dials upstream, runs its startup + actor
+/// loop in its own task under a child context (so a per-connection watcher
+/// closes both sockets on cancellation), and logs its own errors — a broken
+/// connection never takes down the accept loop.
+pub fn listen_and_serve(
+  ctx: context.Context,
+  listen_addr: string,
+  upstream_addr: string,
+  events: Channel<event.Event>,
+) -> Result<(), error> {
+  let mut lc = net.ListenConfig { .. }
+  let listener = lc.Listen(ctx, "tcp", listen_addr).wrap_err("postgres: listen")?
+
+  // Close the listener on cancellation to unblock Accept.
+  task {
+    let _ = ctx.Done().receive()
+    let _ = listener.Close()
+  }
+
+  loop {
+    match listener.Accept() {
+      Ok(client_conn) => {
+        task {
+          serve_conn(ctx, client_conn, upstream_addr, events)
+        }
+      },
+      Err(e) => {
+        if ctx.Err().is_some() { return Ok(()) }
+        return Err(e).wrap_err("postgres: accept")
+      },
+    }
+  }
+}
+
+/// Serve one accepted client connection: dial upstream, install a watcher that
+/// closes both sockets when the connection context is cancelled, run the
+/// relay, and log any error.
+fn serve_conn(
+  ctx: context.Context,
+  client_conn: net.Conn,
+  upstream_addr: string,
+  events: Channel<event.Event>,
+) {
+  let (conn_ctx, cancel) = context.WithCancel(ctx)
+
+  let mut dialer = net.Dialer { .. }
+  let upstream_conn = match dialer.DialContext(conn_ctx, "tcp", upstream_addr) {
+    Ok(u) => u,
+    Err(e) => {
+      log.Printf("postgres: dial upstream %s: %v", upstream_addr, e)
+      let _ = client_conn.Close()
+      cancel()
+      return
+    },
+  }
+
+  // Watcher: cancellation closes both sockets, unblocking the reader tasks.
+  task {
+    let _ = conn_ctx.Done().receive()
+    let _ = client_conn.Close()
+    let _ = upstream_conn.Close()
+  }
+
+  let mut c = Conn.new(client_conn, upstream_conn, events)
+  match run_connection(&c) {
+    Ok(_) => {},
+    Err(e) => {
+      log.Printf("postgres: relay %s: %v", client_conn.RemoteAddr(), e)
+    },
+  }
+
+  let _ = client_conn.Close()
+  let _ = upstream_conn.Close()
+  cancel()
+}

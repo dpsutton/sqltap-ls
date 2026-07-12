@@ -1,0 +1,512 @@
+import "event"
+import "proxy"
+import "go:encoding/binary"
+import "go:io"
+import "go:net"
+import "go:strconv"
+import "go:strings"
+import "go:time"
+
+const SSL_REQUEST_CODE: uint32 = 80877103
+const GSS_ENC_REQUEST_CODE: uint32 = 80877104
+
+const AUTH_TYPE_OK: uint32 = 0
+const AUTH_TYPE_SASL_FINAL: uint32 = 12
+
+/// A frame flowing through the connection actor's single inbox. Every frame is
+/// the exact bytes read off one socket (RAW RELAY — never re-encoded), tagged
+/// with its direction, plus the two end-of-stream signals.
+pub enum Frame {
+  /// A whole message read from the client, to be written to upstream.
+  FromClient(Slice<byte>),
+  /// A whole message read from upstream, to be written to the client.
+  FromUpstream(Slice<byte>),
+  /// The client reader stopped; `error` is the read error, if any.
+  ClientDone(Option<error>),
+  /// The upstream reader stopped; `error` is the read error, if any.
+  UpstreamDone(Option<error>),
+}
+
+/// Per-connection capture state and IO handles. Owned exclusively by the actor
+/// loop after startup, so there are no locks: a single goroutine reads and
+/// mutates every field.
+struct Conn {
+  client_conn: net.Conn,
+  upstream_conn: net.Conn,
+  events: Channel<event.Event>,
+
+  tx: proxy.TxTracker,
+  next_id: uint64,
+
+  // Extended-query state.
+  prepared_stmts: Map<string, string>,
+  prepared_stmt_oids: Map<string, Slice<uint32>>,
+  last_parse: string,
+  last_param_oids: Slice<uint32>,
+  last_bind_args: Slice<string>,
+  last_bind_stmt: string,
+  // FIFO of statement names from Describe('S'); ParameterDescription responses
+  // arrive in the same order, so we pop from the front.
+  pending_describes: Slice<string>,
+
+  // Event awaiting an upstream response (CommandComplete / ErrorResponse).
+  pending: Option<event.Event>,
+}
+
+impl Conn {
+  fn new(
+    client_conn: net.Conn,
+    upstream_conn: net.Conn,
+    events: Channel<event.Event>,
+  ) -> Conn {
+    Conn {
+      client_conn,
+      upstream_conn,
+      events,
+      tx: proxy.TxTracker.new(),
+      next_id: 0,
+      prepared_stmts: Map.new(),
+      prepared_stmt_oids: Map.new(),
+      last_parse: "",
+      last_param_oids: [],
+      last_bind_args: [],
+      last_bind_stmt: "",
+      pending_describes: [],
+      pending: None,
+    }
+  }
+
+  fn generate_id(self: Ref<Conn>) -> string {
+    self.next_id += 1
+    strconv.FormatUint(self.next_id, 10)
+  }
+}
+
+/// `io.ReadFull` / `net.Conn.Write` return `Partial<int, error>` (both a byte
+/// count and an error can be meaningful). For our purposes any error is a hard
+/// failure, so collapse the Partial into a plain Result.
+fn read_full(r: net.Conn, mut buf: Slice<byte>) -> Result<(), error> {
+  match io.ReadFull(r, buf) {
+    Ok(_) => Ok(()),
+    Err(e) => Err(e),
+    Both(_, e) => Err(e),
+  }
+}
+
+fn write_all(w: net.Conn, buf: Slice<byte>) -> Result<(), error> {
+  match w.Write(buf) {
+    Ok(_) => Ok(()),
+    Err(e) => Err(e),
+    Both(_, e) => Err(e),
+  }
+}
+
+/// Read a startup-format message (no type byte): 4-byte BE length + payload.
+/// The returned slice includes the 4-byte header so it can be relayed verbatim.
+fn read_startup_raw(r: net.Conn) -> Result<Slice<byte>, error> {
+  let mut hdr: Slice<byte> = new_bytes(4)
+  read_full(r, hdr)?
+  let msg_len = binary.BigEndian.Uint32(hdr)
+  if msg_len < 4 {
+    return Err(mk_error("postgres: invalid startup message length"))
+  }
+  let mut buf: Slice<byte> = new_bytes(msg_len as int)
+  copy_into(buf, hdr, 0)
+  read_full(r, buf[4..buf.length()])?
+  Ok(buf)
+}
+
+/// Read a regular framed message: 1-byte type + 4-byte BE length (incl. itself)
+/// + payload. The returned slice includes the full 5-byte header.
+fn read_message_raw(r: net.Conn) -> Result<Slice<byte>, error> {
+  let mut hdr: Slice<byte> = new_bytes(5)
+  read_full(r, hdr)?
+  let msg_len = binary.BigEndian.Uint32(hdr[1..5])
+  let total = 1 + (msg_len as int)
+  let mut buf: Slice<byte> = new_bytes(total)
+  copy_into(buf, hdr, 0)
+  read_full(r, buf[5..total])?
+  Ok(buf)
+}
+
+/// Allocate a zeroed byte slice of length `n`.
+fn new_bytes(n: int) -> Slice<byte> {
+  let mut b: Slice<byte> = []
+  for _ in 0..n {
+    b = b.append(0)
+  }
+  b
+}
+
+/// Copy `src` into `dst` starting at `offset`. `dst` is a Go slice, so writes
+/// through it mutate the caller's backing array.
+fn copy_into(mut dst: Slice<byte>, src: Slice<byte>, offset: int) {
+  for i in 0..src.length() {
+    dst[offset + i] = src[i]
+  }
+}
+
+/// Minimal error type so we can construct connection errors without importing
+/// errors just for one string.
+struct ConnError {
+  message: string,
+}
+
+impl ConnError {
+  fn Error(self) -> string {
+    self.message
+  }
+}
+
+fn mk_error(message: string) -> error {
+  ConnError { message }
+}
+
+/// Handle the startup/auth phase entirely as raw byte relay. Returns Ok once
+/// the connection is ready for the framed relay loop (ReadyForQuery seen), or
+/// an error on auth failure / IO error.
+fn relay_startup(c: Ref<Conn>) -> Result<(), error> {
+  // SSLRequest / GSSEncRequest handling, then forward the real StartupMessage.
+  loop {
+    let raw = read_startup_raw(c.client_conn)?
+    if raw.length() == 8 {
+      let code = binary.BigEndian.Uint32(raw[4..8])
+      if code == SSL_REQUEST_CODE || code == GSS_ENC_REQUEST_CODE {
+        write_all(c.client_conn, decline_byte())?
+        continue
+      }
+    }
+    write_all(c.upstream_conn, raw)?
+    break
+  }
+
+  // Relay auth messages raw until ReadyForQuery.
+  loop {
+    let msg = read_message_raw(c.upstream_conn)?
+    write_all(c.client_conn, msg)?
+
+    let type_byte = msg[0]
+    if type_byte == ascii('Z') {
+      return Ok(())
+    } else if type_byte == ascii('E') {
+      return Err(mk_error("postgres: auth error from upstream"))
+    } else if type_byte == ascii('R') {
+      if msg.length() >= 9 {
+        let auth_type = binary.BigEndian.Uint32(msg[5..9])
+        if auth_type != AUTH_TYPE_OK && auth_type != AUTH_TYPE_SASL_FINAL {
+          let resp = read_message_raw(c.client_conn)?
+          write_all(c.upstream_conn, resp)?
+        }
+      }
+    }
+  }
+}
+
+fn decline_byte() -> Slice<byte> {
+  [ascii('N')]
+}
+
+/// Run a single connection: startup phase, then spawn the two reader tasks and
+/// serve the actor loop until either side ends. `ctx` cancellation is handled
+/// by the caller closing both sockets.
+pub fn run_connection(
+  c: Ref<Conn>,
+) -> Result<(), error> {
+  relay_startup(c)?
+
+  // One inbox for both directions. Buffered so a reader is never blocked by the
+  // actor momentarily busy on the other direction.
+  let inbox = Channel.buffered<Frame>(64)
+
+  let client_conn = c.client_conn
+  let upstream_conn = c.upstream_conn
+
+  task { read_loop(client_conn, inbox, true) }
+  task { read_loop(upstream_conn, inbox, false) }
+
+  actor_loop(c, inbox)
+}
+
+/// A reader task: read whole frames off one socket and forward them into the
+/// shared inbox until the socket errors, then send the matching Done signal.
+fn read_loop(conn: net.Conn, inbox: Channel<Frame>, from_client: bool) {
+  loop {
+    match read_message_raw(conn) {
+      Ok(msg) => {
+        let frame = if from_client {
+          Frame.FromClient(msg)
+        } else {
+          Frame.FromUpstream(msg)
+        }
+        if !inbox.send(frame) {
+          return
+        }
+      },
+      Err(e) => {
+        let done = if from_client {
+          Frame.ClientDone(read_end_error(e))
+        } else {
+          Frame.UpstreamDone(read_end_error(e))
+        }
+        let _ = inbox.send(done)
+        return
+      },
+    }
+  }
+}
+
+/// A clean EOF/closed-socket read is normal teardown, not an error to report.
+fn read_end_error(e: error) -> Option<error> {
+  if is_closed_err(e) {
+    None
+  } else {
+    Some(e)
+  }
+}
+
+/// The single serialized owner of all capture state. Receives frames in the
+/// order the readers produced them (per-direction ordering preserved because
+/// each direction flows through this one loop), updates capture state, and
+/// writes the raw bytes to the opposite socket.
+fn actor_loop(c: Ref<Conn>, inbox: Channel<Frame>) -> Result<(), error> {
+  loop {
+    let frame = match inbox.receive() {
+      Some(f) => f,
+      None => return Ok(()),
+    }
+    match frame {
+      Frame.FromClient(msg) => {
+        capture_client(c, msg)
+        match write_all(c.upstream_conn, msg) {
+          Ok(_) => {},
+          Err(_) => { close_both(c); return Ok(()) },
+        }
+      },
+      Frame.FromUpstream(msg) => {
+        capture_upstream(c, msg)
+        match write_all(c.client_conn, msg) {
+          Ok(_) => {},
+          Err(_) => { close_both(c); return Ok(()) },
+        }
+      },
+      Frame.ClientDone(err) => {
+        close_both(c)
+        return err_to_result(err)
+      },
+      Frame.UpstreamDone(err) => {
+        close_both(c)
+        return err_to_result(err)
+      },
+    }
+  }
+}
+
+fn err_to_result(err: Option<error>) -> Result<(), error> {
+  match err {
+    Some(e) => Err(e),
+    None => Ok(()),
+  }
+}
+
+/// Close both sockets to unblock the still-running reader task.
+fn close_both(c: Ref<Conn>) {
+  let _ = c.client_conn.Close()
+  let _ = c.upstream_conn.Close()
+}
+
+// ---- capture: client → upstream ----
+
+fn capture_client(c: Ref<Conn>, msg: Slice<byte>) {
+  if msg.length() < 5 {
+    return
+  }
+  let type_byte = msg[0]
+  let payload = msg[5..msg.length()]
+  if type_byte == ascii('Q') {
+    handle_simple_query(c, payload)
+  } else if type_byte == ascii('P') {
+    handle_parse(c, payload)
+  } else if type_byte == ascii('D') {
+    handle_describe(c, payload)
+  } else if type_byte == ascii('B') {
+    handle_bind(c, payload)
+  } else if type_byte == ascii('E') {
+    handle_execute(c)
+  }
+}
+
+fn handle_simple_query(c: Ref<Conn>, payload: Slice<byte>) {
+  let q = parse_simple_query(payload)
+  let id = c.generate_id()
+  let info = c.tx.transition(q, event.Op.Query, proxy.random_tx_id())
+  c.pending = Some(new_pending(id, info, q, []))
+}
+
+fn handle_parse(c: Ref<Conn>, payload: Slice<byte>) {
+  let m = match parse_parse(payload) {
+    Some(v) => v,
+    None => { return },
+  }
+  c.last_parse = m.query
+  c.last_param_oids = m.param_oids
+  if m.name != "" {
+    c.prepared_stmt_oids[m.name] = m.param_oids
+    c.prepared_stmts[m.name] = m.query
+  }
+}
+
+fn handle_describe(c: Ref<Conn>, payload: Slice<byte>) {
+  let m = match parse_describe(payload) {
+    Some(v) => v,
+    None => { return },
+  }
+  if m.object_type == ascii('S') {
+    c.pending_describes = c.pending_describes.append(m.name)
+  }
+}
+
+fn handle_bind(c: Ref<Conn>, payload: Slice<byte>) {
+  let m = match parse_bind(payload) {
+    Some(v) => v,
+    None => { return },
+  }
+  c.last_bind_stmt = m.stmt_name
+
+  let mut param_oids = c.last_param_oids.clone()
+  if m.stmt_name != "" {
+    match c.prepared_stmt_oids.get(m.stmt_name) {
+      Some(oids) => { param_oids = oids.clone() },
+      None => {},
+    }
+  }
+
+  let mut args: Slice<string> = []
+  for i in 0..m.params.length() {
+    let mut oid: uint32 = 0
+    if i < param_oids.length() {
+      oid = param_oids[i]
+    }
+    let is_bin = is_binary_format(m.format_codes, i)
+    args = args.append(render_param(m.params[i], is_bin, oid))
+  }
+  c.last_bind_args = args
+}
+
+fn handle_execute(c: Ref<Conn>) {
+  let mut q = c.last_parse
+  if c.last_bind_stmt != "" {
+    match c.prepared_stmts.get(c.last_bind_stmt) {
+      Some(stored) => { q = stored },
+      None => {},
+    }
+  }
+  let id = c.generate_id()
+  let info = c.tx.transition(q, event.Op.Execute, proxy.random_tx_id())
+  c.pending = Some(new_pending(id, info, q, c.last_bind_args))
+}
+
+/// Build a fresh pending event with a start timestamp.
+fn new_pending(
+  id: string,
+  info: proxy.TxInfo,
+  query: string,
+  args: Slice<string>,
+) -> event.Event {
+  event.Event {
+    id,
+    op: info.op,
+    query,
+    args,
+    start_time: time.Now(),
+    duration: 0 as time.Duration,
+    outcome: event.Outcome.Ok { rows_affected: 0 },
+    tx_id: info.tx_id,
+    nplus1: false,
+    slow: false,
+    normalized_query: "",
+  }
+}
+
+// ---- capture: upstream → client ----
+
+fn capture_upstream(c: Ref<Conn>, msg: Slice<byte>) {
+  if msg.length() < 5 {
+    return
+  }
+  let type_byte = msg[0]
+  let payload = msg[5..msg.length()]
+  if type_byte == ascii('t') {
+    handle_parameter_description(c, payload)
+  } else if type_byte == ascii('C') {
+    handle_command_complete(c, payload)
+  } else if type_byte == ascii('E') {
+    handle_error_response(c, payload)
+  } else if type_byte == ascii('Z') {
+    c.pending_describes = []
+  }
+}
+
+fn handle_parameter_description(c: Ref<Conn>, payload: Slice<byte>) {
+  if c.pending_describes.length() == 0 {
+    return
+  }
+  let name = c.pending_describes[0]
+  c.pending_describes = c.pending_describes[1..c.pending_describes.length()]
+
+  let oids = parse_parameter_description(payload)
+  if name == "" {
+    c.last_param_oids = oids
+  } else {
+    c.prepared_stmt_oids[name] = oids
+  }
+}
+
+fn handle_command_complete(c: Ref<Conn>, payload: Slice<byte>) {
+  let ev = match c.pending {
+    Some(e) => e,
+    None => { return },
+  }
+  c.pending = None
+  let tag = parse_simple_query(payload)
+  let rows = parse_rows_affected(tag)
+  let completed = event.Event {
+    duration: time.Since(ev.start_time),
+    outcome: event.Outcome.Ok { rows_affected: rows },
+    ..ev
+  }
+  emit_event(c, completed)
+}
+
+fn handle_error_response(c: Ref<Conn>, payload: Slice<byte>) {
+  let ev = match c.pending {
+    Some(e) => e,
+    None => { return },
+  }
+  c.pending = None
+  let message = parse_error_message(payload)
+  let completed = event.Event {
+    duration: time.Since(ev.start_time),
+    outcome: event.Outcome.Failed { message },
+    ..ev
+  }
+  emit_event(c, completed)
+}
+
+/// Emit an event into the events channel without ever blocking the relay: if
+/// the channel is full, the event is dropped.
+fn emit_event(c: Ref<Conn>, ev: event.Event) {
+  select {
+    c.events.send(ev) => {},
+    _ => {},
+  }
+}
+
+/// Classify a read error as a normal closed-connection teardown.
+fn is_closed_err(e: error) -> bool {
+  let msg = e.Error()
+  strings_contains(msg, "EOF") || strings_contains(msg, "closed")
+}
+
+fn strings_contains(haystack: string, needle: string) -> bool {
+  strings.Contains(haystack, needle)
+}
