@@ -1,0 +1,135 @@
+import "event"
+
+/// A subscription handle returned by `Broker.subscribe`. `events` receives
+/// published events until the subscription is dropped; `id` identifies it for
+/// `Broker.unsubscribe`.
+pub struct Subscription {
+  /// Receiving end of this subscriber's buffered channel. Closed on unsubscribe.
+  pub events: Channel<event.Event>,
+  /// Opaque handle for `Broker.unsubscribe`.
+  pub id: int,
+}
+
+/// Messages driving the broker actor. The actor owns all mutable state
+/// (the subscriber map and id counter), so no locking is needed.
+enum Command {
+  /// Register a new subscriber; the actor replies with its `Subscription`.
+  Subscribe { reply: Channel<Subscription> },
+  /// Drop a subscriber by id. Idempotent: unknown ids are ignored.
+  Unsubscribe { id: int },
+  /// Fan an event out to every current subscriber (non-blocking).
+  Publish { ev: event.Event },
+  /// Report the current subscriber count on `count_reply`.
+  Count { count_reply: Channel<int> },
+  /// Stop the actor and close every remaining subscriber channel.
+  Stop,
+}
+
+/// A non-blocking fan-out pub/sub for `event.Event`.
+///
+/// A single actor task owns the subscriber map; all operations are messages on
+/// `commands`, so the broker is safe to share across tasks without locks.
+/// Slow subscribers silently drop events: `publish` never blocks the caller.
+pub struct Broker {
+  commands: Channel<Command>,
+}
+
+impl Broker {
+  /// Create a broker whose subscriber channels are buffered with `buf_size`
+  /// slots. Spawns the owning actor task, which lives until `close` is called.
+  pub fn new(buf_size: int) -> Broker {
+    let commands = Channel.new<Command>()
+    task run_actor(commands, buf_size)
+    Broker { commands }
+  }
+
+  /// Register a subscriber and return its `Subscription`. Blocks only until the
+  /// actor replies (never on delivery).
+  pub fn subscribe(self) -> Subscription {
+    let reply = Channel.buffered<Subscription>(1)
+    let _ = self.commands.send(Command.Subscribe { reply })
+    // The actor only closes `reply` without sending after `close`; then surface
+    // a detached, already-closed subscription so callers never block.
+    reply.receive().unwrap_or_else(dead_subscription)
+  }
+
+  /// Drop the subscriber with `id`, closing its channel. Idempotent: calling it
+  /// again (or with an unknown id) is a no-op.
+  pub fn unsubscribe(self, id: int) {
+    let _ = self.commands.send(Command.Unsubscribe { id })
+  }
+
+  /// Deliver `ev` to every subscriber. Never blocks: a subscriber whose buffer
+  /// is full silently drops the event.
+  pub fn publish(self, ev: event.Event) {
+    let _ = self.commands.send(Command.Publish { ev })
+  }
+
+  /// Number of active subscribers. Intended for tests and diagnostics.
+  pub fn subscriber_count(self) -> int {
+    let reply = Channel.buffered<int>(1)
+    let _ = self.commands.send(Command.Count { count_reply: reply })
+    reply.receive().unwrap_or(0)
+  }
+
+  /// Stop the actor and close every remaining subscriber channel. Subsequent
+  /// `publish`/`unsubscribe` calls are dropped; `subscribe` returns a detached,
+  /// already-closed subscription. Optional — a broker may safely run for the
+  /// whole process lifetime (the Go original has no Close).
+  pub fn close(self) {
+    let _ = self.commands.send(Command.Stop)
+  }
+}
+
+/// A detached, already-closed subscription, returned when the broker has been
+/// stopped so `subscribe` never blocks a caller.
+fn dead_subscription() -> Subscription {
+  let dead = Channel.new<event.Event>()
+  dead.close()
+  Subscription { events: dead, id: -1 }
+}
+
+/// The broker actor: owns the subscriber map and id counter, and processes one
+/// command at a time until it receives `Stop` (or `commands` closes).
+fn run_actor(commands: Channel<Command>, buf_size: int) {
+  let mut subscribers: Map<int, Channel<event.Event>> = Map.new()
+  let mut next_id = 0
+  loop {
+    let Some(cmd) = commands.receive() else {
+      break
+    };
+    match cmd {
+      Command.Subscribe { reply } => {
+        let id = next_id
+        next_id += 1
+        let ch = Channel.buffered<event.Event>(buf_size)
+        subscribers[id] = ch
+        let _ = reply.send(Subscription { events: ch, id })
+      },
+      Command.Unsubscribe { id } => {
+        if let Some(ch) = subscribers.get(id) {
+          subscribers.delete(id)
+          ch.close()
+        }
+      },
+      Command.Publish { ev } => {
+        for (_, ch) in subscribers {
+          // Non-blocking send: drop the event for a full (slow) subscriber.
+          let _sent = select {
+            ch.send(ev) => true,
+            _ => false,
+          }
+        }
+      },
+      Command.Count { count_reply } => {
+        let _ = count_reply.send(subscribers.length())
+      },
+      Command.Stop => {
+        for (_, ch) in subscribers {
+          ch.close()
+        }
+        break
+      },
+    }
+  }
+}
